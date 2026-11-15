@@ -1,0 +1,20 @@
+# STATUS: PLANNED — local Kubernetes for the DevOps demo.
+#   k3d cluster create --config devops/k8s/k3d-cluster.yaml
+# Traefik (built into k3s) serves *.localhost on port 80: f1.localhost, api.f1.localhost,
+# argocd.localhost and grafana.localhost all resolve to 127.0.0.1 in browsers.
+apiVersion: k3d.io/v1alpha5
+kind: Simple
+metadata:
+  name: f1-fantasy
+servers: 1
+agents: 1
+ports:
+  - port: 80:80
+    nodeFilters: [loadbalancer]
+  - port: 443:443
+    nodeFilters: [loadbalancer]
+options:
+  k3s:
+    extraArgs:
+      - arg: --disable=metrics-server   # kube-prometheus-stack provides metrics
+        nodeFilters: [server:*]

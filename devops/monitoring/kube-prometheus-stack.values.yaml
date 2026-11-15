@@ -1,0 +1,35 @@
+# STATUS: PLANNED — Prometheus + Grafana + Alertmanager for the cluster.
+#   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#   helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+#     -n monitoring --create-namespace -f devops/monitoring/kube-prometheus-stack.values.yaml
+prometheus:
+  prometheusSpec:
+    retention: 7d
+    # Pick up ServiceMonitors/PrometheusRules from every namespace, not only this release's.
+    serviceMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    resources:
+      requests: { cpu: 100m, memory: 400Mi }
+    # Jenkins runs outside the cluster (Docker on the host) with the Prometheus plugin.
+    additionalScrapeConfigs:
+      - job_name: jenkins
+        metrics_path: /prometheus
+        static_configs:
+          - targets: ["host.k3d.internal:8080"]
+
+grafana:
+  adminPassword: change-me
+  ingress:
+    enabled: true
+    ingressClassName: traefik
+    hosts: [grafana.localhost]
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard   # loads the ConfigMap from the f1-fantasy chart
+      searchNamespace: ALL
+
+alertmanager:
+  alertmanagerSpec:
+    resources:
+      requests: { cpu: 10m, memory: 50Mi }

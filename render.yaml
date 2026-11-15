@@ -1,0 +1,45 @@
+# Render Blueprint — free tier. Database: a free Neon Postgres (paste its URL as DATABASE_URL).
+services:
+  - type: web
+    name: f1-fantasy-api
+    runtime: node
+    plan: free
+    rootDir: Backend
+    buildCommand: npm ci && npm run db:setup
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_REFRESH_SECRET
+        generateValue: true
+      - key: SEED_ADMIN_EMAIL
+        sync: false
+      - key: SEED_ADMIN_PASSWORD
+        sync: false
+      - key: CORS_ORIGIN
+        fromService:
+          type: web
+          name: f1-fantasy-web
+          property: host
+
+  - type: web
+    name: f1-fantasy-web
+    runtime: static
+    rootDir: Frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_API_BASE
+        fromService:
+          type: web
+          name: f1-fantasy-api
+          property: host

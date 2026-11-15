@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  STATUS: PLANNED — used by devops/jenkins/Jenkinsfile.devsecops (OWASP Dependency-Check).
+  Add a <suppress> per accepted false positive, with the reason in <notes> and an expiry date.
+-->
+<suppressions xmlns="https://jeremylong.github.io/DependencyCheck/dependency-suppression.1.3.xsd">
+    <!-- Example:
+    <suppress until="2027-01-01Z">
+        <notes>False positive: CPE matches a different product with the same name.</notes>
+        <packageUrl regex="true">^pkg:npm/example@.*$</packageUrl>
+        <cve>CVE-2024-00000</cve>
+    </suppress>
+    -->
+</suppressions>

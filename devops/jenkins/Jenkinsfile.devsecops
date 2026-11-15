@@ -1,0 +1,197 @@
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+// STATUS: PLANNED — not active. The pipeline in use is /Jenkinsfile.
+// Full DevSecOps pipeline for F1 Fantasy (see docs/DEVOPS.md, Part B).
+//
+//   GitHub push ─▶ secrets scan ─▶ lint/test ─▶ dependency CVEs ─▶ SonarQube + gate ─▶ images
+//   ─▶ Trivy ─▶ push to GHCR ─▶ bump Helm tag in Git ─▶ ArgoCD syncs ─▶ ZAP scan of the deployed app
+//
+// Extra Jenkins setup on top of devops/jenkins-setup.sh:
+//   Plugins:      hashicorp-vault-plugin (optional), htmlpublisher, prometheus (Jenkins metrics)
+//   Credentials:  ghcr-token        (username + GitHub PAT with write:packages)
+//                 github-push       (username + PAT with repo scope, used to commit the image tag)
+//                 nvd-api-key       (secret text, free key from nvd.nist.gov for Dependency-Check)
+// ─────────────────────────────────────────────────────────────────────────────────────────────
+pipeline {
+    agent any
+
+    triggers { githubPush() }
+
+    parameters {
+        string(name: 'REGISTRY', defaultValue: 'ghcr.io/floyd-pinto', description: 'Image registry/namespace')
+        string(name: 'STAGING_URL', defaultValue: 'http://f1.localhost', description: 'Deployed frontend for the ZAP scan')
+        string(name: 'API_URL', defaultValue: 'http://api.f1.localhost', description: 'API URL baked into the frontend image')
+        booleanParam(name: 'GITOPS_RELEASE', defaultValue: true, description: 'Push images and bump the Helm tag (main only)')
+    }
+
+    environment {
+        TEST_DB_PORT = '55499'
+        TEST_DATABASE_URL = 'postgresql://postgres:postgres@localhost:55499/f1_test'
+        TAG = "${env.GIT_COMMIT?.take(7) ?: env.BUILD_NUMBER}"
+        BACKEND_IMAGE = "${params.REGISTRY}/f1-fantasy-backend"
+        FRONTEND_IMAGE = "${params.REGISTRY}/f1-fantasy-frontend"
+        REPORTS = 'reports'
+    }
+
+    options {
+        timeout(time: 45, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timestamps()
+    }
+
+    stages {
+        stage('Skip release commits') {
+            steps {
+                script {
+                    // The GitOps stage commits the new image tag; that push fires the webhook again.
+                    // Stop here for those commits, or every release would trigger another release.
+                    if (sh(script: 'git log -1 --pretty=%B', returnStdout: true).contains('[skip ci]')) {
+                        currentBuild.result = 'NOT_BUILT'
+                        error('Release commit from Jenkins: nothing to build')
+                    }
+                }
+            }
+        }
+
+        stage('Secrets scan (TruffleHog)') {
+            steps {
+                sh 'mkdir -p $REPORTS'
+                // Scans the full git history; fails only on secrets TruffleHog can verify are live.
+                sh '''
+                    docker run --rm --network host -v "$PWD:/repo" trufflesecurity/trufflehog:latest \
+                      git file:///repo --only-verified --fail --json > $REPORTS/trufflehog.json
+                '''
+            }
+        }
+
+        stage('Backend: lint & test') {
+            steps {
+                script {
+                    def db = "f1-test-${env.BUILD_NUMBER}"
+                    try {
+                        sh """
+                            docker run -d --rm --name ${db} --network host \
+                              -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=f1_test -e PGPORT=${TEST_DB_PORT} postgres:16-alpine
+                            for i in \$(seq 1 30); do docker exec ${db} pg_isready -U postgres -p ${TEST_DB_PORT} && break; sleep 1; done
+                        """
+                        dir('Backend') {
+                            withEnv(["DATABASE_URL=${TEST_DATABASE_URL}"]) {
+                                sh 'npm ci && npm run lint && npx prisma migrate deploy && npm run test:coverage'
+                            }
+                        }
+                    } finally {
+                        sh "docker rm -f ${db} || true"
+                    }
+                }
+            }
+        }
+
+        stage('Frontend: lint, typecheck & build') {
+            steps {
+                dir('Frontend') { sh 'npm ci && npm run lint && npm run typecheck && npm run build' }
+            }
+        }
+
+        stage('Dependency CVEs (OWASP Dependency-Check)') {
+            steps {
+                withCredentials([string(credentialsId: 'nvd-api-key', variable: 'NVD_API_KEY')]) {
+                    // The NVD database is cached in a named volume so later runs take seconds, not minutes.
+                    sh '''
+                        docker run --rm --network host \
+                          -v "$PWD:/src" -v dependency-check-data:/usr/share/dependency-check/data \
+                          owasp/dependency-check:latest \
+                          --project f1-fantasy --scan /src/Backend --scan /src/Frontend \
+                          --exclude "**/node_modules/**" --exclude "**/archive/**" \
+                          --suppression /src/devops/security/dependency-check-suppressions.xml \
+                          --nvdApiKey "$NVD_API_KEY" --failOnCVSS 7 \
+                          --format HTML --format JSON --out /src/$REPORTS
+                    '''
+                }
+            }
+        }
+
+        stage('SAST (SonarQube)') {
+            steps {
+                withSonarQubeEnv('SonarQube') { sh 'sonar-scanner -Dsonar.projectVersion=$TAG' }
+                timeout(time: 5, unit: 'MINUTES') { waitForQualityGate abortPipeline: true }
+            }
+        }
+
+        stage('Build images') {
+            steps {
+                sh '''
+                    docker build --network host -t $BACKEND_IMAGE:$TAG Backend
+                    docker build --network host --build-arg VITE_API_BASE=$API_URL -t $FRONTEND_IMAGE:$TAG Frontend
+                '''
+            }
+        }
+
+        stage('Image scan (Trivy)') {
+            steps {
+                // Fails on fixable CRITICAL/HIGH vulnerabilities; the full report is archived.
+                sh '''
+                    for img in $BACKEND_IMAGE:$TAG $FRONTEND_IMAGE:$TAG; do
+                      name=$(basename ${img%%:*})
+                      docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v trivy-cache:/root/.cache \
+                        -v "$PWD/devops/security/.trivyignore:/.trivyignore" aquasec/trivy:latest image \
+                        --ignorefile /.trivyignore --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 "$img"
+                      docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v trivy-cache:/root/.cache \
+                        aquasec/trivy:latest image --format json "$img" > "$REPORTS/trivy-$name.json"
+                    done
+                '''
+            }
+        }
+
+        stage('Push images (GHCR)') {
+            when { allOf { branch 'main'; expression { params.GITOPS_RELEASE } } }
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'ghcr-token', usernameVariable: 'U', passwordVariable: 'P')]) {
+                    sh '''
+                        echo "$P" | docker login ghcr.io -u "$U" --password-stdin
+                        docker push $BACKEND_IMAGE:$TAG
+                        docker push $FRONTEND_IMAGE:$TAG
+                        docker logout ghcr.io
+                    '''
+                }
+            }
+        }
+
+        stage('GitOps release (bump Helm tag)') {
+            when { allOf { branch 'main'; expression { params.GITOPS_RELEASE } } }
+            steps {
+                // ArgoCD watches devops/helm/f1-fantasy; committing the new tag *is* the deployment.
+                withCredentials([usernamePassword(credentialsId: 'github-push', usernameVariable: 'U', passwordVariable: 'P')]) {
+                    sh '''
+                        sed -i "s|^\\(\\s*tag:\\).*|\\1 \\"$TAG\\"|" devops/helm/f1-fantasy/values-prod.yaml
+                        git config user.name "jenkins"
+                        git config user.email "jenkins@localhost"
+                        git commit -am "release: f1-fantasy $TAG [skip ci]" || echo "tag unchanged"
+                        git push "https://$U:$P@${GIT_URL#https://}" HEAD:main
+                    '''
+                }
+            }
+        }
+
+        stage('DAST (OWASP ZAP baseline)') {
+            when { allOf { branch 'main'; expression { params.GITOPS_RELEASE } } }
+            steps {
+                // Give ArgoCD time to roll out, then run a passive scan against the deployed app.
+                sh 'for i in $(seq 1 60); do curl -fsS $API_URL/health && break; sleep 5; done'
+                sh '''
+                    docker run --rm --network host -v "$PWD:/zap/wrk:rw" zaproxy/zap-stable \
+                      zap-baseline.py -t "$STAGING_URL" -c devops/security/zap-baseline.conf \
+                      -r $REPORTS/zap-report.html -J $REPORTS/zap-report.json -I
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'reports/**, Backend/coverage/lcov.info', allowEmptyArchive: true
+            publishHTML(target: [reportDir: 'reports', reportFiles: 'dependency-check-report.html, zap-report.html',
+                                 reportName: 'Security reports', allowMissing: true, keepAll: true, alwaysLinkToLastBuild: true])
+        }
+        failure { echo 'Pipeline failed: see the stage log and the Security reports link.' }
+    }
+}

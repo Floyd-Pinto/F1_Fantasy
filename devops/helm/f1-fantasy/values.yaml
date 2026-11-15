@@ -1,0 +1,59 @@
+# STATUS: PLANNED — default values for local Kubernetes (k3d). Production overrides: values-prod.yaml.
+
+backend:
+  image:
+    repository: ghcr.io/floyd-pinto/f1-fantasy-backend
+    tag: latest
+    pullPolicy: IfNotPresent
+  # Must stay 1: cron jobs and the SSE pub/sub run in-process (see docs/DEVOPS.md → design constraints).
+  replicas: 1
+  port: 4000
+  resources:
+    requests: { cpu: 100m, memory: 192Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+  env:
+    NODE_ENV: production
+    CORS_ORIGIN: http://f1.localhost
+    REAL_DATA_SYNC: "true"
+  # Seeding pulls the real season from free APIs on first start.
+  seedOnStart: true
+
+frontend:
+  image:
+    repository: ghcr.io/floyd-pinto/f1-fantasy-frontend
+    tag: latest
+    pullPolicy: IfNotPresent
+  replicas: 2            # static files behind nginx — safe to scale
+  port: 80
+  resources:
+    requests: { cpu: 25m, memory: 32Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+postgres:
+  enabled: true          # set false to use a managed database via secrets.databaseUrl
+  image: postgres:16-alpine
+  database: f1fantasy
+  storage: 2Gi
+
+# Created as a Kubernetes Secret unless existingSecret is set (e.g. synced from Vault by External Secrets).
+secrets:
+  existingSecret: ""
+  jwtSecret: change-me-access-secret
+  jwtRefreshSecret: change-me-refresh-secret
+  postgresPassword: change-me-db-password
+  databaseUrl: ""        # only when postgres.enabled=false
+  seedAdminEmail: ""
+  seedAdminPassword: ""
+
+ingress:
+  enabled: true
+  className: traefik     # k3d/k3s default; use nginx on other clusters
+  webHost: f1.localhost
+  apiHost: api.f1.localhost
+  tls: false
+
+monitoring:
+  # Requires the kube-prometheus-stack CRDs (devops/monitoring) and the backend /metrics endpoint.
+  serviceMonitor: false
+  alertRules: false
+  grafanaDashboard: false

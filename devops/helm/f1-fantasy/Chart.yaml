@@ -1,0 +1,7 @@
+# STATUS: PLANNED — not deployed yet. See docs/DEVOPS.md, Part B.
+apiVersion: v2
+name: f1-fantasy
+description: F1 Fantasy — API, web frontend and PostgreSQL on Kubernetes
+type: application
+version: 0.1.0
+appVersion: "2.0.0"

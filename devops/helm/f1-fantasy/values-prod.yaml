@@ -1,0 +1,14 @@
+# STATUS: PLANNED — overrides applied by ArgoCD (devops/argocd/application.yaml).
+# The Jenkins "GitOps release" stage rewrites both `tag:` lines on every main-branch build.
+backend:
+  image:
+    tag: "latest"
+frontend:
+  image:
+    tag: "latest"
+secrets:
+  existingSecret: f1-fantasy-secrets   # created from Vault, never committed
+monitoring:
+  serviceMonitor: true
+  alertRules: true
+  grafanaDashboard: true

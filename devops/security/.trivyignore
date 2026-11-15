@@ -1,0 +1,3 @@
+# STATUS: PLANNED — used by devops/jenkins/Jenkinsfile.devsecops (Trivy image scan).
+# One CVE id per line, each with a reason and a review date, e.g.:
+# CVE-2024-00000   # not reachable: affects a CLI tool not used at runtime — review 2027-01

@@ -1,0 +1,28 @@
+# STATUS: PLANNED — GitOps: ArgoCD keeps the cluster in sync with devops/helm/f1-fantasy on main.
+# Apply once:  kubectl apply -n argocd -f devops/argocd/application.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: f1-fantasy
+  namespace: argocd
+  finalizers: [resources-finalizer.argocd.argoproj.io]
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Floyd-Pinto/F1_Fantasy.git
+    targetRevision: main
+    path: devops/helm/f1-fantasy
+    helm:
+      releaseName: f1-fantasy
+      valueFiles: [values.yaml, values-prod.yaml]
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: f1-fantasy
+  syncPolicy:
+    automated:
+      prune: true      # delete resources removed from Git
+      selfHeal: true   # undo manual changes made with kubectl
+    syncOptions: [CreateNamespace=true]
+    retry:
+      limit: 5
+      backoff: { duration: 10s, factor: 2, maxDuration: 3m }
