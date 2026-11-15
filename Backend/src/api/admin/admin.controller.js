@@ -1,83 +1,55 @@
 import prisma from '../../config/db.js'
+import { parseId } from '../../utils/http.js'
+import { syncSeason } from '../../services/sync.service.js'
+
+const USER_FIELDS = { id: true, username: true, email: true, role: true, created_at: true }
 
 export const listUsers = async (req, res) => {
-    try {
-        // Avoid selecting `role` directly because the Prisma client may not have it
-        // if the DB/schema migration wasn't applied yet.
-        const users = await prisma.user.findMany({
-            select: { id: true, username: true, email: true, created_at: true },
-            orderBy: { created_at: 'desc' }
-        })
-
-        res.json(users)
-    } catch (err) {
-        console.error(err)
-        if (err?.message?.includes('Unknown field `role`')) {
-            return res.status(500).json({ error: "Database schema missing 'role' on User. Run Prisma migration (e.g. `npx prisma migrate dev --name add-role` or `npx prisma db push`) and restart the server." })
-        }
-        res.status(500).json({ error: 'Failed to fetch users' })
-    }
+    const users = await prisma.user.findMany({
+        select: USER_FIELDS,
+        orderBy: { created_at: 'desc' }
+    })
+    res.json(users)
 }
 
-export const promoteUser = async (req, res) => {
-    try {
-        const id = Number(req.params.userId)
-        if (isNaN(id)) return res.status(400).json({ error: 'Invalid user id' })
+const setRole = (role) => async (req, res) => {
+    const id = parseId(req.params.userId, 'User ID')
 
-        const user = await prisma.user.findUnique({ where: { id } })
-        if (!user) return res.status(404).json({ error: 'User not found' })
-
-        const updated = await prisma.user.update({ where: { id }, data: { role: 'ADMIN' } })
-        res.json({ message: 'User promoted', user: { id: updated.id, username: updated.username, role: updated.role } })
-    } catch (err) {
-        console.error(err)
-        if (err?.message?.includes('Unknown field `role`')) {
-            return res.status(500).json({ error: "Database schema missing 'role' on User. Run Prisma migration (e.g. `npx prisma migrate dev --name add-role` or `npx prisma db push`) and restart the server." })
-        }
-        res.status(500).json({ error: 'Failed to promote user' })
+    if (role === 'USER' && id === req.user.id) {
+        return res.status(400).json({ error: 'You cannot demote yourself' })
     }
+
+    const user = await prisma.user.findUnique({ where: { id } })
+    if (!user) return res.status(404).json({ error: 'User not found' })
+
+    const updated = await prisma.user.update({ where: { id }, data: { role }, select: USER_FIELDS })
+    res.json({ message: role === 'ADMIN' ? 'User promoted' : 'User demoted', user: updated })
 }
 
-export const demoteUser = async (req, res) => {
-    try {
-        const id = Number(req.params.userId)
-        if (isNaN(id)) return res.status(400).json({ error: 'Invalid user id' })
+export const promoteUser = setRole('ADMIN')
+export const demoteUser = setRole('USER')
 
-        const user = await prisma.user.findUnique({ where: { id } })
-        if (!user) return res.status(404).json({ error: 'User not found' })
-
-        const updated = await prisma.user.update({ where: { id }, data: { role: 'USER' } })
-        res.json({ message: 'User demoted', user: { id: updated.id, username: updated.username, role: updated.role } })
-    } catch (err) {
-        console.error(err)
-        if (err?.message?.includes('Unknown field `role`')) {
-            return res.status(500).json({ error: "Database schema missing 'role' on User. Run Prisma migration (e.g. `npx prisma migrate dev --name add-role` or `npx prisma db push`) and restart the server." })
-        }
-        res.status(500).json({ error: 'Failed to demote user' })
-    }
-}
-
-// Bootstrapping endpoint to set first admin using a secret token
+// One-time bootstrap of the first admin, guarded by ADMIN_BOOT_TOKEN.
+// The token is accepted from the body or a header only (never the query string, which ends up in logs).
 export const bootAdmin = async (req, res) => {
-    try {
-        const bootToken = req.body?.token || req.headers['x-admin-boot'] || req.query.token
-        const expected = process.env.ADMIN_BOOT_TOKEN
-        if (!expected) return res.status(403).json({ error: 'Boot not enabled' })
-        if (!bootToken || bootToken !== expected) return res.status(401).json({ error: 'Invalid boot token' })
+    const expected = process.env.ADMIN_BOOT_TOKEN
+    if (!expected) return res.status(403).json({ error: 'Boot not enabled' })
 
-        const id = Number(req.params.userId)
-        if (isNaN(id)) return res.status(400).json({ error: 'Invalid user id' })
+    const bootToken = req.body?.token || req.headers['x-admin-boot']
+    if (!bootToken || bootToken !== expected) return res.status(401).json({ error: 'Invalid boot token' })
 
-        const existingAdmin = await prisma.user.findFirst({ where: { role: 'ADMIN' } })
-        if (existingAdmin) return res.status(409).json({ error: 'Admin already exists' })
+    const id = parseId(req.params.userId, 'User ID')
 
-        const updated = await prisma.user.update({ where: { id }, data: { role: 'ADMIN' } })
-        res.json({ message: 'Bootstrapped admin', user: { id: updated.id, username: updated.username, role: updated.role } })
-    } catch (err) {
-        console.error(err)
-        if (err?.message?.includes('Unknown field `role`')) {
-            return res.status(500).json({ error: "Database schema missing 'role' on User. Run Prisma migration (e.g. `npx prisma migrate dev --name add-role` or `npx prisma db push`) and restart the server." })
-        }
-        res.status(500).json({ error: 'Failed to bootstrap admin' })
-    }
+    const existingAdmin = await prisma.user.findFirst({ where: { role: 'ADMIN' } })
+    if (existingAdmin) return res.status(409).json({ error: 'Admin already exists' })
+
+    const updated = await prisma.user.update({ where: { id }, data: { role: 'ADMIN' }, select: USER_FIELDS })
+    res.json({ message: 'Bootstrapped admin', user: updated })
+}
+
+// Pull real drivers, teams, standings, calendar and results from Jolpica-F1 / OpenF1.
+export const syncRealData = async (req, res) => {
+    const season = Number(req.body?.season) || new Date().getUTCFullYear()
+    const summary = await syncSeason(season, { force: Boolean(req.body?.force) })
+    res.json({ message: 'Sync complete', ...summary })
 }

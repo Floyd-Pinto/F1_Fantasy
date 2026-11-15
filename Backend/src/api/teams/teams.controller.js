@@ -1,25 +1,18 @@
-import cron from 'node-cron'
 import prisma from '../../config/db.js'
+import { parseId, badRequest } from '../../utils/http.js'
+import { TEAM_BUDGET, DRIVERS_PER_TEAM } from '../../config/game.js'
 
-const normalizeId = (value, fieldName) => {
-    const id = Number(value)
-
-    if (!Number.isInteger(id) || id <= 0) {
-        throw new Error(`${fieldName} must be a valid ID`)
-    }
-
-    return id
+const TEAM_INCLUDE = {
+    predictions: { include: { driver: true }, orderBy: { predictedPosition: 'asc' } },
+    constructor: true
 }
 
 const normalizePredictedPosition = (value) => {
     if (value === undefined || value === null || value === '') return null
-
     const position = Number(value)
-
-    if (!Number.isInteger(position) || position < 1 || position > 20) {
-        throw new Error('Predicted position must be between 1 and 20')
+    if (!Number.isInteger(position) || position < 1 || position > 30) {
+        throw badRequest('Predicted position must be between 1 and 30')
     }
-
     return position
 }
 
@@ -27,386 +20,216 @@ const normalizeTeamPredictions = ({ driverIds, predictions }) => {
     const source = Array.isArray(predictions) && predictions.length > 0
         ? predictions
         : Array.isArray(driverIds)
-            ? driverIds.map((driverId, index) => ({
-                driverId,
-                predictedPosition: index + 1
-            }))
+            ? driverIds.map((driverId) => ({ driverId, predictedPosition: null })) // predictions are opt-in
             : null
 
-    if (!source) {
-        throw new Error('Driver predictions are required')
-    }
+    if (!source) throw badRequest('Driver predictions are required')
 
-    const normalized = source.map((prediction, index) => {
+    const normalized = source.map((prediction) => {
         const isObject = typeof prediction === 'object' && prediction !== null
         const driverId = isObject ? prediction.driverId ?? prediction.id : prediction
-        const rawPosition = isObject
-            ? prediction.predictedPosition ?? prediction.position ?? index + 1
-            : index + 1
-
+        const rawPosition = isObject ? prediction.predictedPosition ?? prediction.position ?? null : null
         return {
-            driverId: normalizeId(driverId, 'Driver ID'),
+            driverId: parseId(driverId, 'Driver ID'),
             predictedPosition: normalizePredictedPosition(rawPosition),
             predictedDNF: Boolean(isObject ? prediction.predictedDNF : false)
         }
     })
 
-    if (normalized.length !== 5) {
-        throw new Error('Exactly 5 drivers required')
-    }
+    if (normalized.length !== DRIVERS_PER_TEAM) throw badRequest(`Exactly ${DRIVERS_PER_TEAM} drivers required`)
+    if (new Set(normalized.map(p => p.driverId)).size !== normalized.length) throw badRequest('Duplicate drivers not allowed')
 
-    if (new Set(normalized.map(prediction => prediction.driverId)).size !== 5) {
-        throw new Error('Duplicate drivers not allowed')
-    }
-
-    const positions = normalized
-        .map(prediction => prediction.predictedPosition)
-        .filter(position => position !== null)
-
-    if (new Set(positions).size !== positions.length) {
-        throw new Error('Duplicate predicted positions not allowed')
-    }
+    const positions = normalized.map(p => p.predictedPosition).filter(p => p !== null)
+    if (new Set(positions).size !== positions.length) throw badRequest('Duplicate predicted positions not allowed')
 
     return normalized
 }
 
-const isClientError = (err) =>
-    err.message?.includes('required') ||
-    err.message?.includes('valid ID') ||
-    err.message?.includes('Duplicate') ||
-    err.message?.includes('between')
+const lockTimeOf = (race) => race.lockAt ?? race.raceStart
+
+// A team can be edited only until the first scoring session (qualifying or sprint) begins.
+const assertRaceOpen = (race) => {
+    if (race.status !== 'SCHEDULED' || new Date() >= lockTimeOf(race)) {
+        throw badRequest('Teams are locked — the race weekend has started')
+    }
+}
+
+const formatTeam = (team) => ({
+    id: team.id,
+    locked: team.locked,
+    driverIds: team.predictions.map(p => p.driverId),
+    constructorId: team.constructorId,
+    captainId: team.captainId,
+    carriedOver: team.carriedOver,
+    drivers: team.predictions.map(p => p.driver.name),
+    predictions: team.predictions.map(p => ({
+        driverId: p.driverId,
+        driverName: p.driver.name,
+        predictedPosition: p.predictedPosition,
+        predictedDNF: p.predictedDNF
+    })),
+    constructor: team.constructor?.name ?? null,
+    cost: Math.round((team.predictions.reduce((s, p) => s + p.driver.price, 0) + (team.constructor?.price || 0)) * 10) / 10
+})
 
 export const buildTeam = async (req, res) => {
-    try {
-        const { raceId, leagueId, driverIds, constructorId, predictions } = req.body
-        const userId = req.user.id
-        const parsedRaceId = normalizeId(raceId, 'Race ID')
-        const parsedLeagueId = normalizeId(leagueId, 'League ID')
-        const parsedConstructorId = normalizeId(constructorId, 'Constructor ID')
-        const teamPredictions = normalizeTeamPredictions({ driverIds, predictions })
-
-        const membership = await prisma.leagueMember.findUnique({
-            where: {
-                leagueId_userId: { leagueId: parsedLeagueId, userId }
-            }
-        })
-
-        if (!membership) {
-            return res.status(403).json({ error: 'Not in league' })
-        }
-
-        const race = await prisma.race.findUnique({ where: { id: parsedRaceId } })
-
-        if (!race) {
-            return res.status(404).json({ error: 'Race not found' })
-        }
-
-        if (new Date() >= race.raceStart) {
-            return res.status(400).json({ error: 'Team locked (race started)' })
-        }
-
-        const existing = await prisma.team.findUnique({
-            where: {
-                userId_raceId_leagueId: {
-                    userId,
-                    raceId: parsedRaceId,
-                    leagueId: parsedLeagueId
-                }
-            }
-        })
-
-        let team
-
-        if (existing) {
-            if (existing.locked) {
-                return res.status(400).json({ error: 'Team already locked' })
-            }
-
-            team = await prisma.team.update({
-                where: { id: existing.id },
-                data: {
-                    constructorId: parsedConstructorId,
-                    predictions: {
-                        deleteMany: {},
-                        create: teamPredictions
-                    }
-                },
-                include: {
-                    predictions: {
-                        include: { driver: true },
-                        orderBy: { predictedPosition: 'asc' }
-                    },
-                    constructor: true
-                }
-            })
-
-        } else {
-            team = await prisma.team.create({
-                data: {
-                    userId,
-                    raceId: parsedRaceId,
-                    leagueId: parsedLeagueId,
-                    constructorId: parsedConstructorId,
-                    predictions: {
-                        create: teamPredictions
-                    }
-                },
-                include: {
-                    predictions: {
-                        include: { driver: true },
-                        orderBy: { predictedPosition: 'asc' }
-                    },
-                    constructor: true
-                }
-            })
-        }
-
-        res.json({ message: 'Team saved', team })
-
-    } catch (err) {
-        if (isClientError(err)) {
-            return res.status(400).json({ error: err.message })
-        }
-
-        console.error(err)
-        res.status(500).json({ error: 'Failed to build team' })
+    const { raceId, leagueId, driverIds, constructorId, predictions, captainId } = req.body || {}
+    const userId = req.user.id
+    const parsedRaceId = parseId(raceId, 'Race ID')
+    const parsedLeagueId = parseId(leagueId, 'League ID')
+    const parsedConstructorId = parseId(constructorId, 'Constructor ID')
+    const teamPredictions = normalizeTeamPredictions({ driverIds, predictions })
+    const parsedCaptainId = captainId == null || captainId === '' ? null : parseId(captainId, 'Captain ID')
+    if (parsedCaptainId && !teamPredictions.some(p => p.driverId === parsedCaptainId)) {
+        throw badRequest('Captain must be one of your five drivers')
     }
+
+    const membership = await prisma.leagueMember.findUnique({
+        where: { leagueId_userId: { leagueId: parsedLeagueId, userId } }
+    })
+    if (!membership) return res.status(403).json({ error: 'Not in league' })
+
+    const race = await prisma.race.findUnique({ where: { id: parsedRaceId } })
+    if (!race) return res.status(404).json({ error: 'Race not found' })
+    assertRaceOpen(race)
+
+    // Validate the roster against the database, not the client: existence, active status and budget.
+    const [drivers, constructor] = await Promise.all([
+        prisma.driver.findMany({ where: { id: { in: teamPredictions.map(p => p.driverId) } } }),
+        prisma.constructor.findUnique({ where: { id: parsedConstructorId } })
+    ])
+    if (drivers.length !== teamPredictions.length) throw badRequest('One or more drivers do not exist')
+    if (drivers.some(d => !d.active)) throw badRequest('One or more drivers are not on the current grid')
+    if (!constructor || !constructor.active) throw badRequest('Constructor does not exist or is inactive')
+
+    const cost = drivers.reduce((sum, d) => sum + d.price, 0) + constructor.price
+    if (cost > TEAM_BUDGET + 1e-9) {
+        throw badRequest(`Team costs $${cost.toFixed(1)}M — over the $${TEAM_BUDGET}M budget`)
+    }
+
+    const key = { userId_raceId_leagueId: { userId, raceId: parsedRaceId, leagueId: parsedLeagueId } }
+    const existing = await prisma.team.findUnique({ where: key })
+    if (existing?.locked) return res.status(400).json({ error: 'Team already locked' })
+
+    const team = existing
+        ? await prisma.team.update({
+            where: { id: existing.id },
+            data: {
+                constructorId: parsedConstructorId,
+                captainId: parsedCaptainId,
+                carriedOver: false,
+                predictions: { deleteMany: {}, create: teamPredictions }
+            },
+            include: TEAM_INCLUDE
+        })
+        : await prisma.team.create({
+            data: {
+                userId,
+                raceId: parsedRaceId,
+                leagueId: parsedLeagueId,
+                constructorId: parsedConstructorId,
+                captainId: parsedCaptainId,
+                predictions: { create: teamPredictions }
+            },
+            include: TEAM_INCLUDE
+        })
+
+    res.json({ message: 'Team saved', team: formatTeam(team) })
 }
 
 export const updatePredictionPosition = async (req, res) => {
-    try {
-        const userId = req.user.id
-        const raceId = normalizeId(req.params.raceId, 'Race ID')
-        const leagueId = normalizeId(req.body.leagueId, 'League ID')
-        const driverId = normalizeId(req.body.driverId, 'Driver ID')
-        const predictedPosition = normalizePredictedPosition(req.body.predictedPosition ?? req.body.position)
+    const userId = req.user.id
+    const raceId = parseId(req.params.raceId, 'Race ID')
+    const leagueId = parseId(req.body?.leagueId, 'League ID')
+    const driverId = parseId(req.body?.driverId, 'Driver ID')
+    const predictedPosition = normalizePredictedPosition(req.body?.predictedPosition ?? req.body?.position)
 
-        if (predictedPosition === null) {
-            return res.status(400).json({ error: 'Predicted position is required' })
-        }
+    if (predictedPosition === null) throw badRequest('Predicted position is required')
 
-        const team = await prisma.team.findUnique({
-            where: {
-                userId_raceId_leagueId: {
-                    userId,
-                    raceId,
-                    leagueId
-                }
-            },
-            include: {
-                predictions: true,
-                race: true
-            }
-        })
+    const team = await prisma.team.findUnique({
+        where: { userId_raceId_leagueId: { userId, raceId, leagueId } },
+        include: { predictions: true, race: true }
+    })
+    if (!team) return res.status(404).json({ error: 'Team not found' })
+    if (team.locked) return res.status(400).json({ error: 'Team already locked' })
+    assertRaceOpen(team.race)
 
-        if (!team) {
-            return res.status(404).json({ error: 'Team not found' })
-        }
-
-        if (team.locked || new Date() >= team.race.raceStart) {
-            return res.status(400).json({ error: 'Team already locked' })
-        }
-
-        const prediction = team.predictions.find(p => p.driverId === driverId)
-
-        if (!prediction) {
-            return res.status(404).json({ error: 'Driver is not in this team' })
-        }
-
-        const duplicatePosition = team.predictions.find(p =>
-            p.driverId !== driverId && p.predictedPosition === predictedPosition
-        )
-
-        if (duplicatePosition) {
-            return res.status(409).json({ error: 'Predicted position already assigned' })
-        }
-
-        const updated = await prisma.prediction.update({
-            where: {
-                teamId_driverId: {
-                    teamId: team.id,
-                    driverId
-                }
-            },
-            data: {
-                predictedPosition
-            },
-            include: {
-                driver: true
-            }
-        })
-
-        res.json({
-            message: 'Prediction updated',
-            prediction: {
-                driverId: updated.driverId,
-                driverName: updated.driver.name,
-                predictedPosition: updated.predictedPosition
-            }
-        })
-
-    } catch (err) {
-        if (isClientError(err)) {
-            return res.status(400).json({ error: err.message })
-        }
-
-        console.error(err)
-        res.status(500).json({ error: 'Failed to update prediction' })
+    if (!team.predictions.some(p => p.driverId === driverId)) {
+        return res.status(404).json({ error: 'Driver is not in this team' })
     }
+    if (team.predictions.some(p => p.driverId !== driverId && p.predictedPosition === predictedPosition)) {
+        return res.status(409).json({ error: 'Predicted position already assigned' })
+    }
+
+    const updated = await prisma.prediction.update({
+        where: { teamId_driverId: { teamId: team.id, driverId } },
+        data: { predictedPosition },
+        include: { driver: true }
+    })
+
+    res.json({
+        message: 'Prediction updated',
+        prediction: { driverId: updated.driverId, driverName: updated.driver.name, predictedPosition: updated.predictedPosition }
+    })
 }
 
 export const lockMyTeam = async (req, res) => {
-    try {
-        const raceId = normalizeId(req.body.raceId, 'Race ID')
-        const leagueId = normalizeId(req.body.leagueId, 'League ID')
-        const userId = req.user.id
+    const raceId = parseId(req.body?.raceId, 'Race ID')
+    const leagueId = parseId(req.body?.leagueId, 'League ID')
 
-        const team = await prisma.team.findUnique({
-            where: {
-                userId_raceId_leagueId: {
-                    userId,
-                    raceId,
-                    leagueId
-                }
-            }
-        })
+    const team = await prisma.team.findUnique({
+        where: { userId_raceId_leagueId: { userId: req.user.id, raceId, leagueId } },
+        include: { race: true }
+    })
+    if (!team) return res.status(404).json({ error: 'Team not found' })
+    if (team.locked) return res.status(400).json({ error: 'Already locked' })
+    assertRaceOpen(team.race)
 
-        if (!team) {
-            return res.status(404).json({ error: 'Team not found' })
-        }
-
-        if (team.locked) {
-            return res.status(400).json({ error: 'Already locked' })
-        }
-
-        const race = await prisma.race.findUnique({ where: { id: raceId } })
-
-        if (new Date() >= race.raceStart) {
-            return res.status(400).json({ error: 'Race started' })
-        }
-
-        await prisma.team.update({
-            where: { id: team.id },
-            data: { locked: true }
-        })
-
-        res.json({ message: 'Team locked' })
-
-    } catch (err) {
-        if (isClientError(err)) {
-            return res.status(400).json({ error: err.message })
-        }
-
-        console.error(err)
-        res.status(500).json({ error: 'Failed to lock team' })
-    }
+    await prisma.team.update({ where: { id: team.id }, data: { locked: true } })
+    res.json({ message: 'Team locked' })
 }
 
 export const getMyTeam = async (req, res) => {
-    try {
-        const raceId = normalizeId(req.params.raceId, 'Race ID')
-        const leagueId = normalizeId(req.query.leagueId, 'League ID')
-        const userId = req.user.id
+    const raceId = parseId(req.params.raceId, 'Race ID')
+    const leagueId = parseId(req.query.leagueId, 'League ID')
 
-        const team = await prisma.team.findUnique({
-            where: {
-                userId_raceId_leagueId: {
-                    userId,
-                    raceId,
-                    leagueId
-                }
-            },
-            include: {
-                predictions: {
-                    include: { driver: true },
-                    orderBy: { predictedPosition: 'asc' }
-                },
-                constructor: true
-            }
-        })
+    const team = await prisma.team.findUnique({
+        where: { userId_raceId_leagueId: { userId: req.user.id, raceId, leagueId } },
+        include: TEAM_INCLUDE
+    })
+    if (!team) return res.status(404).json({ error: 'No team found' })
 
-        if (!team) {
-            return res.status(404).json({ error: 'No team found' })
-        }
+    const points = await prisma.points.findUnique({
+        where: { userId_raceId_leagueId: { userId: req.user.id, raceId, leagueId } }
+    })
 
-        res.json({
-            id: team.id,
-            locked: team.locked,
-            drivers: team.predictions.map(p => p.driver.name),
-            predictions: team.predictions.map(p => ({
-                driverId: p.driverId,
-                driverName: p.driver.name,
-                predictedPosition: p.predictedPosition,
-                predictedDNF: p.predictedDNF
-            })),
-            constructor: team.constructor?.name
-        })
+    res.json({ ...formatTeam(team), points: points?.totalPts ?? null, breakdown: points?.breakdown ?? null })
+}
 
-    } catch (err) {
-        if (isClientError(err)) {
-            return res.status(400).json({ error: err.message })
-        }
+// The player's most recent team in this league before the given race (used to prefill the builder).
+export const getPreviousTeam = async (req, res) => {
+    const raceId = parseId(req.params.raceId, 'Race ID')
+    const leagueId = parseId(req.query.leagueId, 'League ID')
+    const race = await prisma.race.findUnique({ where: { id: raceId } })
+    if (!race) return res.status(404).json({ error: 'Race not found' })
 
-        console.error(err)
-        res.status(500).json({ error: 'Failed to fetch team' })
-    }
+    const team = await prisma.team.findFirst({
+        where: { userId: req.user.id, leagueId, race: { raceStart: { lt: race.raceStart } } },
+        include: { ...TEAM_INCLUDE, race: { select: { name: true } } },
+        orderBy: { race: { raceStart: 'desc' } }
+    })
+    if (!team) return res.status(404).json({ error: 'No previous team' })
+    res.json({ ...formatTeam(team), fromRace: team.race.name })
 }
 
 export const unlockTeamAdmin = async (req, res) => {
-    try {
-        const teamId = normalizeId(req.body.teamId, 'Team ID')
-
-        await prisma.team.update({
-            where: { id: teamId },
-            data: { locked: false }
-        })
-
-        res.json({ message: 'Team unlocked (admin)' })
-
-    } catch (err) {
-        if (isClientError(err)) {
-            return res.status(400).json({ error: err.message })
-        }
-
-        console.error(err)
-        res.status(500).json({ error: 'Failed to unlock team' })
-    }
+    const teamId = parseId(req.body?.teamId, 'Team ID')
+    await prisma.team.update({ where: { id: teamId }, data: { locked: false } })
+    res.json({ message: 'Team unlocked (admin)' })
 }
 
 export const autoLockTeamsForRace = async (req, res) => {
-    try {
-        const raceId = normalizeId(req.params.raceId, 'Race ID')
-
-        await prisma.team.updateMany({
-            where: {
-                raceId,
-                locked: false
-            },
-            data: { locked: true }
-        })
-
-        res.json({ message: 'All teams locked' })
-
-    } catch (err) {
-        if (isClientError(err)) {
-            return res.status(400).json({ error: err.message })
-        }
-
-        console.error(err)
-        res.status(500).json({ error: 'Failed to auto-lock teams' })
-    }
+    const raceId = parseId(req.params.raceId, 'Race ID')
+    const { count } = await prisma.team.updateMany({ where: { raceId, locked: false }, data: { locked: true } })
+    res.json({ message: 'All teams locked', count })
 }
-
-cron.schedule('* * * * *', async () => {
-    await prisma.team.updateMany({
-        where: {
-            locked: false,
-            race: {
-                raceStart: {
-                    lte: new Date()
-                }
-            }
-        },
-        data: { locked: true }
-    })
-})

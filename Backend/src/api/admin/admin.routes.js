@@ -1,5 +1,5 @@
 import express from 'express'
-import { listUsers, promoteUser, demoteUser, bootAdmin } from './admin.controller.js'
+import { listUsers, promoteUser, demoteUser, bootAdmin, syncRealData } from './admin.controller.js'
 import { protect } from '../middleware/auth.middleware.js'
 import { isAdmin } from '../middleware/admin.middleware.js'
 
@@ -15,5 +15,6 @@ router.use(isAdmin)
 router.get('/users', listUsers)
 router.post('/promote/:userId', promoteUser)
 router.post('/demote/:userId', demoteUser)
+router.post('/sync', syncRealData)
 
 export default router

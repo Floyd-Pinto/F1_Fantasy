@@ -1,152 +1,65 @@
 import prisma from '../../config/db.js'
-import { getDriverPoints, calculateRacePoints } from './results.service.js'
+import { parseId, httpError } from '../../utils/http.js'
+import { calculateRacePoints, saveRaceResults } from './results.service.js'
+import { weekendPoints } from '../../scoring/scoring.js'
+import { activeSimulations } from '../../live/raceRunner.js'
 
+const guardNotSimulating = (raceId) => {
+    if (activeSimulations.has(raceId)) {
+        throw httpError(409, 'Stop the running simulation before editing results')
+    }
+}
 
 export const submitResults = async (req, res) => {
-    try {
-        const { raceId, results } = req.body
-
-        if (!raceId || !results) {
-            return res.status(400).json({ error: 'Missing fields' })
-        }
-
-        // 🧹 Clear old results if any (safe re-run)
-        await prisma.raceResult.deleteMany({
-            where: { raceId }
-        })
-
-        // 📝 Insert results
-        await prisma.raceResult.createMany({
-            data: results.map(r => ({
-                raceId,
-                driverId: r.driverId,
-                finishPosition: r.finish_pos,
-                fastestLap: r.fastest_lap || false,
-                dnf: r.dnf || false
-            }))
-        })
-
-        // 🔒 Lock all teams
-        await prisma.team.updateMany({
-            where: { raceId },
-            data: { locked: true }
-        })
-
-        // 🧠 Calculate points
-        await calculateRacePoints(raceId)
-
-        // Mark race as completed
-        try {
-            await prisma.race.update({ where: { id: raceId }, data: { status: 'COMPLETED' } })
-        } catch (err) {
-            console.error('Failed to set race status to COMPLETED', err)
-        }
-
-        res.json({ message: 'Results saved and scoring triggered' })
-
-    } catch (err) {
-        res.status(500).json({ error: 'Failed to submit results' })
-    }
+    const raceId = parseId(req.body?.raceId, 'Race ID')
+    guardNotSimulating(raceId)
+    await saveRaceResults(raceId, req.body?.results)
+    res.json({ message: 'Results saved and scoring triggered' })
 }
-
 
 export const updateResults = async (req, res) => {
-    try {
-        const raceId = Number(req.params.raceId)
-        const { results } = req.body
-
-        await prisma.raceResult.deleteMany({
-            where: { raceId }
-        })
-
-        await prisma.raceResult.createMany({
-            data: results.map(r => ({
-                raceId,
-                driverId: r.driverId,
-                finishPosition: r.finish_pos,
-                fastestLap: r.fastest_lap || false,
-                dnf: r.dnf || false
-            }))
-        })
-
-        // 🔁 Recalculate
-        await calculateRacePoints(raceId)
-
-        // Lock teams and mark race completed
-        try {
-            await prisma.team.updateMany({ where: { raceId }, data: { locked: true } })
-            await prisma.race.update({ where: { id: raceId }, data: { status: 'COMPLETED' } })
-        } catch (err) {
-            console.error('Failed to lock teams or set race status', err)
-        }
-
-        res.json({ message: 'Results updated and re-scored' })
-
-    } catch (err) {
-        res.status(500).json({ error: 'Failed to update results' })
-    }
+    const raceId = parseId(req.params.raceId, 'Race ID')
+    guardNotSimulating(raceId)
+    await saveRaceResults(raceId, req.body?.results)
+    res.json({ message: 'Results updated and re-scored' })
 }
 
-
-export const getRaceResults = async (req, res) => {
-    try {
-        const raceId = Number(req.params.raceId)
-
-        const results = await prisma.raceResult.findMany({
-            where: { raceId },
-            include: {
-                driver: true
-            },
-            orderBy: {
-                finishPosition: 'asc'
-            }
-        })
-
-        const formatted = results.map(r => ({
+const formatResults = (results) =>
+    results.map(r => {
+        const pts = weekendPoints(r)
+        return {
             driver_id: r.driverId,
             driver_name: r.driver.name,
+            driver_code: r.driver.code,
+            driver_number: r.driver.number,
+            headshot_url: r.driver.headshotUrl,
+            constructor_name: r.driver.constructor?.name || null,
+            team_color: r.driver.constructor?.color || null,
             finish_pos: r.finishPosition,
             fastest_lap: r.fastestLap,
             dnf: r.dnf,
-            points: getDriverPoints(r)
-        }))
+            quali_pos: r.qualiPosition,
+            sprint_pos: r.sprintPosition,
+            sprint_dnf: r.sprintDnf,
+            points: pts.total,
+            points_breakdown: { race: pts.race, sprint: pts.sprint, quali: pts.quali }
+        }
+    })
 
-        res.json(formatted)
+export const getRaceResults = async (req, res) => {
+    const raceId = parseId(req.params.raceId, 'Race ID')
 
-    } catch (err) {
-        res.status(500).json({ error: 'Failed to fetch results' })
-    }
+    const results = await prisma.raceResult.findMany({
+        where: { raceId },
+        include: { driver: { include: { constructor: { select: { name: true, color: true } } } } },
+        orderBy: [{ dnf: 'asc' }, { finishPosition: { sort: 'asc', nulls: 'last' } }]
+    })
+
+    res.json(formatResults(results))
 }
 
 export const calculateResults = async (req, res) => {
-    try {
-        const raceId = Number(req.params.raceId)
-
-        if (!Number.isInteger(raceId) || raceId <= 0) {
-            return res.status(400).json({ error: 'Invalid race ID' })
-        }
-
-        await calculateRacePoints(raceId)
-
-        // Lock teams and mark race completed
-        try {
-            await prisma.team.updateMany({ where: { raceId }, data: { locked: true } })
-            await prisma.race.update({ where: { id: raceId }, data: { status: 'COMPLETED' } })
-        } catch (err) {
-            console.error('Failed to lock teams or set race status', err)
-        }
-
-        res.json({
-            message: 'Race points calculated successfully',
-            raceId
-        })
-
-    } catch (err) {
-        console.error(err)
-        res.status(500).json({ error: 'Failed to calculate race points' })
-    }
+    const raceId = parseId(req.params.raceId, 'Race ID')
+    const scored = await calculateRacePoints(raceId)
+    res.json({ message: 'Race points calculated successfully', raceId, teamsScored: scored })
 }
-
-
-
-// calculateRacePoints is implemented in the results service

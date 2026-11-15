@@ -5,7 +5,8 @@ import {
     unlockTeamAdmin,
     getMyTeam,
     autoLockTeamsForRace,
-    updatePredictionPosition
+    updatePredictionPosition,
+    getPreviousTeam
 } from './teams.controller.js'
 
 import { protect } from '../middleware/auth.middleware.js'
@@ -24,7 +25,8 @@ router.post('/lock', lockMyTeam)
 // update one selected driver's predicted finishing position
 router.patch('/:raceId/predictions', updatePredictionPosition)
 
-// fetch
+// fetch (previous must come before the :raceId catch-all)
+router.get('/previous/:raceId', getPreviousTeam)
 router.get('/:raceId', getMyTeam)
 
 // admin override

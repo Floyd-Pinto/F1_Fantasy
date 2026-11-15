@@ -1,18 +1,23 @@
 import express from 'express'
-import { register } from './auth.controller.js'
-import { login } from './auth.controller.js'
-import { getMe } from './auth.controller.js'
-import { logout } from './auth.controller.js'
-import { refresh } from './auth.controller.js'
+import rateLimit from 'express-rate-limit'
+import { register, login, getMe, logout, refresh } from './auth.controller.js'
 import { protect } from '../middleware/auth.middleware.js'
 
 const router = express.Router()
 
-router.post('/register', register)
-router.post('/login', login)
+// Slow down credential stuffing / signup spam.
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: Number(process.env.AUTH_RATE_LIMIT) || 20,
+    standardHeaders: 'draft-7',
+    legacyHeaders: false,
+    message: { error: 'Too many attempts, please try again later' }
+})
+
+router.post('/register', authLimiter, register)
+router.post('/login', authLimiter, login)
 router.get('/me', protect, getMe)
 router.post('/logout', logout)
 router.post('/refresh', refresh)
 
 export default router
-

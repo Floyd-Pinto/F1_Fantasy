@@ -1,26 +1,16 @@
 import express from 'express'
-import {
-    getAllUsers,
-    getUserById,
-    updateUserProfile,
-    deleteUser
-} from './users.controller.js'
-
+import { getAllUsers, getUserById, updateUserProfile, deleteUser, getMyHistory } from './users.controller.js'
 import { protect } from '../middleware/auth.middleware.js'
 import { isAdmin } from '../middleware/admin.middleware.js'
 
 const router = express.Router()
 
-// Public endpoint for user profile
-router.get('/:id', getUserById)
-
-// Protected endpoints
 router.use(protect)
-router.put('/:id', updateUserProfile)
 
-// Admin endpoints
-router.use(isAdmin)
-router.get('/', getAllUsers)
-router.delete('/:id', deleteUser)
+router.get('/', isAdmin, getAllUsers)
+router.get('/me/history', getMyHistory)
+router.get('/:id', getUserById)
+router.put('/:id', updateUserProfile)
+router.delete('/:id', isAdmin, deleteUser)
 
 export default router

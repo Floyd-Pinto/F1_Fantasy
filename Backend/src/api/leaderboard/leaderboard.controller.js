@@ -1,191 +1,173 @@
 import prisma from '../../config/db.js'
+import { parseId } from '../../utils/http.js'
 
+// Standard competition ranking: ties share a rank (1, 2, 2, 4).
+const withRanks = (rows, key) => {
+    let rank = 0
+    return rows.map((row, i) => {
+        if (i === 0 || row[key] !== rows[i - 1][key]) rank = i + 1
+        return { rank, ...row }
+    })
+}
 
+const assertCanView = async (leagueId, user) => {
+    const league = await prisma.league.findUnique({ where: { id: leagueId } })
+    if (!league) return null
+    if (league.league_type === 'PRIVATE' && user.role !== 'ADMIN') {
+        const member = await prisma.leagueMember.findUnique({
+            where: { leagueId_userId: { leagueId, userId: user.id } }
+        })
+        if (!member) return null
+    }
+    return league
+}
+
+// Season standings for a league — every member appears, including those on 0 points.
 export const getLeagueLeaderboard = async (req, res) => {
-    try {
-        const leagueId = Number(req.params.leagueId)
-        if (!Number.isInteger(leagueId) || leagueId <= 0) {
-            return res.status(400).json({ error: 'Invalid league ID' })
-        }
+    const leagueId = parseId(req.params.leagueId, 'League ID')
+    if (!(await assertCanView(leagueId, req.user))) {
+        return res.status(404).json({ error: 'League not found' })
+    }
 
-        // aggregate total points per user across all races in the league
-        const data = await prisma.points.groupBy({
+    const [members, totals] = await Promise.all([
+        prisma.leagueMember.findMany({
+            where: { leagueId },
+            include: { user: { select: { id: true, username: true } } }
+        }),
+        prisma.points.groupBy({
             by: ['userId'],
             where: { leagueId },
-            _sum: { totalPts: true }
+            _sum: { totalPts: true },
+            _count: { raceId: true }
         })
+    ])
 
-        if (!data || data.length === 0) {
-            return res.json([])
-        }
+    const totalsByUser = new Map(totals.map(t => [t.userId, t]))
+    const rows = members
+        .map(m => ({
+            userId: m.user.id,
+            username: m.user.username,
+            season_total: totalsByUser.get(m.user.id)?._sum.totalPts || 0,
+            races_played: totalsByUser.get(m.user.id)?._count.raceId || 0
+        }))
+        .sort((a, b) => b.season_total - a.season_total || a.username.localeCompare(b.username))
 
-        // fetch usernames for the users present
-        const users = await prisma.user.findMany({
-            where: { id: { in: data.map(d => d.userId) } },
-            select: { id: true, username: true }
-        })
-
-        const userMap = {}
-        users.forEach(u => { userMap[u.id] = u.username })
-
-        const leaderboard = data
-            .map(d => ({
-                userId: d.userId,
-                username: userMap[d.userId] || null,
-                season_total: (d._sum && d._sum.totalPts) || 0
-            }))
-            .sort((a, b) => b.season_total - a.season_total)
-
-        res.json(leaderboard)
-
-    } catch (err) {
-        res.status(500).json({ error: 'Failed to fetch leaderboard' })
-    }
+    res.json(withRanks(rows, 'season_total'))
 }
-
-
 
 export const getRaceLeaderboard = async (req, res) => {
-    try {
-        const leagueId = Number(req.params.leagueId)
-        const raceId = Number(req.params.raceId)
-
-        const data = await prisma.points.findMany({
-            where: {
-                leagueId,
-                raceId
-            },
-            include: {
-                user: {
-                    select: {
-                        username: true
-                    }
-                }
-            }
-        })
-
-        const sorted = data.sort((a, b) => b.totalPts - a.totalPts)
-
-        let rank = 1
-        const leaderboard = sorted.map((entry, index) => {
-            if (index > 0 && entry.totalPts < sorted[index - 1].totalPts) {
-                rank = index + 1
-            }
-
-            return {
-                rank,
-                username: entry.user.username,
-                total_pts: entry.totalPts,
-                breakdown: entry.breakdown
-            }
-        })
-
-        res.json(leaderboard)
-
-    } catch (err) {
-        res.status(500).json({ error: 'Failed to fetch race leaderboard' })
+    const leagueId = parseId(req.params.leagueId, 'League ID')
+    const raceId = parseId(req.params.raceId, 'Race ID')
+    if (!(await assertCanView(leagueId, req.user))) {
+        return res.status(404).json({ error: 'League not found' })
     }
+
+    const data = await prisma.points.findMany({
+        where: { leagueId, raceId },
+        include: { user: { select: { id: true, username: true } } },
+        orderBy: { totalPts: 'desc' }
+    })
+
+    res.json(withRanks(data.map(entry => ({
+        userId: entry.user.id,
+        username: entry.user.username,
+        total_pts: entry.totalPts,
+        breakdown: entry.breakdown
+    })), 'total_pts'))
 }
 
-
-export const getGlobalLeaderboard = async (req, res) => {
-    try {
-        const now = new Date();
-
-        // 1) Global total points per user (include users with 0)
-        const totals = await prisma.points.groupBy({
-            by: ['userId'],
-            _sum: { totalPts: true }
-        });
-
-        const users = await prisma.user.findMany({ select: { id: true, username: true } });
-
-        const totalsMap = {};
-        totals.forEach(t => { totalsMap[t.userId] = (t._sum && t._sum.totalPts) || 0 });
-
-        const allUsers = users.map(u => ({
-            userId: u.id,
-            username: u.username,
-            totalPts: totalsMap[u.id] || 0
-        }));
-
-        const sortedByTotal = allUsers.slice().sort((a, b) => b.totalPts - a.totalPts);
-
-        const top5 = sortedByTotal.slice(0, 5);
-
-        const maxOverall = top5[0] || null;
-
-        // 2) Determine current race by time (ongoing or most recently completed)
-        let currentRace = await prisma.race.findFirst({
-            where: {
-                raceStart: { lte: now },
-                OR: [
-                    { raceEnd: null },
-                    { raceEnd: { gte: now } }
-                ]
-            },
-            orderBy: { raceStart: 'desc' }
-        });
-
-        if (!currentRace) {
-            currentRace = await prisma.race.findFirst({
-                where: { raceEnd: { lte: now } },
-                orderBy: { raceEnd: 'desc' }
-            });
-        }
-
-        let currentRaceInfo = null;
-        if (currentRace) {
-            const racePoints = await prisma.points.findMany({ where: { raceId: currentRace.id } });
-
-            // compute per-user max points for the race (users may have multiple league entries)
-            const perUserMax = {};
-            racePoints.forEach(p => {
-                const uid = p.userId;
-                perUserMax[uid] = Math.max(perUserMax[uid] || 0, p.totalPts || 0);
-            });
-
-            const entries = Object.keys(perUserMax).map(k => ({ userId: Number(k), points: perUserMax[k] }));
-            entries.sort((a, b) => b.points - a.points);
-
-            const maxPoints = entries.length > 0 ? entries[0].points : 0;
-
-            // fetch usernames for top performers in this race (could be ties)
-            const leaderUserIds = entries.filter(e => e.points === maxPoints).map(e => e.userId);
-            const leaderUsers = await prisma.user.findMany({ where: { id: { in: leaderUserIds } }, select: { id: true, username: true } });
-
-            currentRaceInfo = {
-                raceId: currentRace.id,
-                name: currentRace.name,
-                maxPoints,
-                leaders: leaderUsers.map(u => ({ userId: u.id, username: u.username, points: perUserMax[u.id] || 0 }))
-            };
-        }
-
-        // 4) global rank for requesting user (if authenticated)
-        const reqUserId = req.user?.id || null;
-        let userRank = null;
-        if (reqUserId) {
-            const idx = sortedByTotal.findIndex(u => u.userId === Number(reqUserId));
-            if (idx >= 0) {
-                userRank = { userId: reqUserId, username: sortedByTotal[idx].username, rank: idx + 1, totalPts: sortedByTotal[idx].totalPts };
-            } else {
-                // user exists but has 0 points (not in totals)
-                const found = allUsers.find(u => u.userId === Number(reqUserId));
-                if (found) userRank = { userId: found.userId, username: found.username, rank: allUsers.length, totalPts: found.totalPts };
-            }
-        }
-
-        res.json({
-            max_overall: maxOverall,
-            current_race: currentRaceInfo,
-            top5,
-            total_players: allUsers.length,
-            user: userRank
-        });
-
-    } catch (err) {
-        console.error('Failed to fetch global leaderboard', err);
-        res.status(500).json({ error: 'Failed to fetch global leaderboard' })
+// Points per race and running totals for every member — powers the league chart.
+export const getLeagueHistory = async (req, res) => {
+    const leagueId = parseId(req.params.leagueId, 'League ID')
+    if (!(await assertCanView(leagueId, req.user))) {
+        return res.status(404).json({ error: 'League not found' })
     }
+
+    const [members, points] = await Promise.all([
+        prisma.leagueMember.findMany({ where: { leagueId }, include: { user: { select: { id: true, username: true } } } }),
+        prisma.points.findMany({ where: { leagueId }, select: { userId: true, raceId: true, totalPts: true } })
+    ])
+    const raceIds = [...new Set(points.map(p => p.raceId))]
+    const races = await prisma.race.findMany({
+        where: { id: { in: raceIds }, status: 'COMPLETED' },
+        select: { id: true, name: true, round: true },
+        orderBy: { raceStart: 'asc' }
+    })
+
+    const pts = new Map(points.map(p => [`${p.userId}:${p.raceId}`, p.totalPts]))
+    res.json({
+        races: races.map(r => ({ id: r.id, name: r.name, round: r.round })),
+        players: members.map(m => {
+            let running = 0
+            const perRace = races.map(r => pts.get(`${m.user.id}:${r.id}`) ?? 0)
+            return {
+                userId: m.user.id,
+                username: m.user.username,
+                perRace,
+                cumulative: perRace.map(p => (running += p))
+            }
+        })
+    })
+}
+
+// Global ranking. A player in several leagues scores once per race: their best entry for that race.
+export const getGlobalLeaderboard = async (req, res) => {
+    const [users, points] = await Promise.all([
+        prisma.user.findMany({ select: { id: true, username: true } }),
+        prisma.points.findMany({ select: { userId: true, raceId: true, totalPts: true } })
+    ])
+
+    const best = new Map() // `${userId}:${raceId}` -> pts
+    for (const p of points) {
+        const k = `${p.userId}:${p.raceId}`
+        best.set(k, Math.max(best.get(k) ?? 0, p.totalPts))
+    }
+    const totals = new Map()
+    const races = new Map()
+    for (const [k, pts] of best) {
+        const userId = Number(k.split(':')[0])
+        totals.set(userId, (totals.get(userId) || 0) + pts)
+        races.set(userId, (races.get(userId) || 0) + 1)
+    }
+
+    const ranked = withRanks(
+        users
+            .map(u => ({ userId: u.id, username: u.username, totalPts: totals.get(u.id) || 0, racesPlayed: races.get(u.id) || 0 }))
+            .sort((a, b) => b.totalPts - a.totalPts || a.username.localeCompare(b.username)),
+        'totalPts'
+    )
+
+    // Current race = a running one, else the most recently completed.
+    const currentRace =
+        (await prisma.race.findFirst({ where: { status: 'ONGOING' }, orderBy: { raceStart: 'desc' } })) ||
+        (await prisma.race.findFirst({ where: { status: 'COMPLETED' }, orderBy: { raceStart: 'desc' } }))
+
+    let currentRaceInfo = null
+    if (currentRace) {
+        const perUser = new Map()
+        for (const p of points) {
+            if (p.raceId === currentRace.id) perUser.set(p.userId, Math.max(perUser.get(p.userId) ?? 0, p.totalPts))
+        }
+        const maxPoints = Math.max(0, ...perUser.values())
+        const names = new Map(users.map(u => [u.id, u.username]))
+        currentRaceInfo = {
+            raceId: currentRace.id,
+            name: currentRace.name,
+            status: currentRace.status,
+            maxPoints,
+            leaders: [...perUser]
+                .filter(([, pts]) => pts === maxPoints && maxPoints > 0)
+                .map(([userId, pts]) => ({ userId, username: names.get(userId), points: pts }))
+        }
+    }
+
+    const me = ranked.find(u => u.userId === req.user.id) || null
+
+    res.json({
+        max_overall: ranked[0] || null,
+        current_race: currentRaceInfo,
+        top: ranked.slice(0, 50),
+        total_players: ranked.length,
+        user: me
+    })
 }

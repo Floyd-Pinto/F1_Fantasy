@@ -2,12 +2,12 @@ import express from 'express'
 import {
     createLeague,
     joinLeague,
+    leaveLeague,
     getUserLeagues,
     getLeagueById,
     deleteLeague,
     getAllLeaguesPublic
 } from './leagues.controller.js'
-
 import { protect } from '../middleware/auth.middleware.js'
 
 const router = express.Router()
@@ -18,6 +18,7 @@ router.post('/create', createLeague)
 router.post('/join', joinLeague)
 router.get('/', getUserLeagues)
 router.get('/:id', getLeagueById)
+router.post('/:id/leave', leaveLeague)
 router.delete('/:id', deleteLeague)
 
 export default router

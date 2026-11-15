@@ -1,16 +1,21 @@
 {
-  "name": "backend",
+  "name": "f1-fantasy-backend",
   "version": "1.0.0",
   "type": "module",
-  "description": "",
+  "description": "F1 Fantasy API: leagues, teams, live race streaming and real F1 data sync",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "nodemon index.js",
     "start": "node index.js",
-    "prisma:generate": "prisma generate",
-    "prisma:push": "prisma db push",
-    "prisma:migrate": "prisma migrate dev"
+    "postinstall": "prisma generate",
+    "seed": "node prisma/seed.js",
+    "db:setup": "prisma migrate deploy && node prisma/seed.js",
+    "test": "node --test \"test/**/*.test.js\"",
+    "test:db": "DATABASE_URL=$TEST_DATABASE_URL prisma migrate deploy",
+    "db:migrate": "prisma migrate deploy",
+    "migrate:dev": "prisma migrate dev",
+    "lint": "eslint .",
+    "test:coverage": "node --test --experimental-test-coverage --test-coverage-exclude=\"prisma/**\" --test-coverage-exclude=\"test/**\" --test-reporter=spec --test-reporter-destination=stdout --test-reporter=lcov --test-reporter-destination=coverage/lcov.info \"test/**/*.test.js\""
   },
   "author": "",
   "license": "ISC",
@@ -22,17 +27,20 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "express-rate-limit": "^7.5.1",
     "jsonwebtoken": "^9.0.3",
     "node-cron": "^4.2.1",
     "pg": "^8.20.0",
-    "prisma": "^7.8.0"
+    "prisma": "^7.8.0",
+    "web-push": "^3.6.7"
   },
   "devDependencies": {
-    "@types/bcrypt": "^6.0.0",
-    "@types/jsonwebtoken": "^9.0.10",
-    "@types/node": "^25.6.0",
-    "nodemon": "^3.1.14",
-    "ts-node": "^10.9.2",
-    "typescript": "^6.0.3"
+    "@eslint/js": "^9.39.5",
+    "eslint": "^9.39.5",
+    "globals": "^15.15.0",
+    "nodemon": "^3.1.14"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }

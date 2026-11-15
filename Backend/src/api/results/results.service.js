@@ -1,103 +1,86 @@
 import prisma from '../../config/db.js'
+import { weekendPoints, scoreTeam } from '../../scoring/scoring.js'
+import { httpError } from '../../utils/http.js'
 
-const POSITION_POINTS = {
-    1: 25, 2: 18, 3: 15, 4: 12, 5: 10,
-    6: 8, 7: 6, 8: 4, 9: 2, 10: 1
+// A driver's weekend total (race + sprint + qualifying), shown next to results.
+export const getDriverPoints = (result) => weekendPoints(result).total
+
+
+// Idempotent: clears previous Points rows for the race and recreates them in one transaction,
+// so leaderboards never observe a half-written state.
+export const calculateRacePoints = async (raceId) => {
+    const [results, teams] = await Promise.all([
+        prisma.raceResult.findMany({ where: { raceId }, include: { driver: { select: { constructorId: true } } } }),
+        prisma.team.findMany({ where: { raceId }, include: { predictions: true } })
+    ])
+
+    const resultsByDriver = new Map(results.map(r => [r.driverId, r]))
+    const constructorOfDriver = new Map(results.map(r => [r.driverId, r.driver?.constructorId ?? null]))
+
+    const pointsData = teams.map(team => {
+        const { total, breakdown } = scoreTeam(team, resultsByDriver, constructorOfDriver)
+        return { userId: team.userId, raceId: team.raceId, leagueId: team.leagueId, totalPts: total, breakdown }
+    })
+
+    await prisma.$transaction([
+        prisma.points.deleteMany({ where: { raceId } }),
+        ...(pointsData.length ? [prisma.points.createMany({ data: pointsData })] : [])
+    ])
+
+    return pointsData.length
 }
 
-const FASTEST_LAP_BONUS = 5
-
-export const getDriverPoints = (result) => {
-    if (!result || result.dnf) return 0
-
-    const positionPoints = POSITION_POINTS[result.finishPosition] || 0
-    const fastestLapPoints = result.fastestLap ? FASTEST_LAP_BONUS : 0
-
-    return positionPoints + fastestLapPoints
+const optionalPosition = (value, field) => {
+    if (value === undefined) return undefined
+    if (value === null || value === '') return null
+    const n = Number(value)
+    if (!Number.isInteger(n) || n < 1) throw httpError(400, `${field} must be a positive integer`)
+    return n
 }
 
-// calculateRacePoints is idempotent: it clears previous Points and recreates them.
-export const calculateRacePoints = async (raceId, client = prisma) => {
-    console.log(`[scoring] calculateRacePoints called for race ${raceId}`)
+/**
+ * Replace a race's results, lock its teams, re-score and mark it COMPLETED.
+ * Each row: { driverId, finish_pos, dnf, fastest_lap, quali_pos?, sprint_pos?, sprint_dnf? }.
+ * Qualifying/sprint fields left undefined keep their stored values, so correcting the race order
+ * in the admin editor never wipes Saturday's results.
+ */
+export const saveRaceResults = async (raceId, results) => {
+    if (!Array.isArray(results) || results.length === 0) throw httpError(400, 'results must be a non-empty array')
 
-    // Get results
-    const results = await client.raceResult.findMany({
-        where: { raceId },
-        include: {
-            driver: {
-                select: { constructorId: true }
-            }
+    const race = await prisma.race.findUnique({ where: { id: raceId } })
+    if (!race) throw httpError(404, 'Race not found')
+
+    const existing = new Map((await prisma.raceResult.findMany({ where: { raceId } })).map(r => [r.driverId, r]))
+
+    const rows = results.map(r => {
+        const driverId = Number(r.driverId)
+        if (!Number.isInteger(driverId) || driverId <= 0) throw httpError(400, 'Each result needs a valid driverId')
+        const prev = existing.get(driverId)
+        const quali = optionalPosition(r.quali_pos, 'quali_pos')
+        const sprint = optionalPosition(r.sprint_pos, 'sprint_pos')
+        return {
+            raceId,
+            driverId,
+            finishPosition: optionalPosition(r.finish_pos, 'finish_pos') ?? null,
+            fastestLap: Boolean(r.fastest_lap),
+            dnf: Boolean(r.dnf),
+            qualiPosition: quali !== undefined ? quali : prev?.qualiPosition ?? null,
+            sprintPosition: sprint !== undefined ? sprint : prev?.sprintPosition ?? null,
+            sprintDnf: r.sprint_dnf !== undefined ? Boolean(r.sprint_dnf) : prev?.sprintDnf ?? false
         }
     })
 
-    console.log(`[scoring] fetched ${results.length} raceResult rows for race ${raceId}`)
+    if (new Set(rows.map(r => r.driverId)).size !== rows.length) throw httpError(400, 'Duplicate driver in results')
+    if (rows.filter(r => r.fastestLap).length > 1) throw httpError(400, 'Only one driver can have the fastest lap')
 
-    const resultMap = {}
-    const constructorPoints = {}
+    await prisma.$transaction([
+        prisma.raceResult.deleteMany({ where: { raceId } }),
+        prisma.raceResult.createMany({ data: rows }),
+        prisma.team.updateMany({ where: { raceId }, data: { locked: true } }),
+        prisma.race.update({ where: { id: raceId }, data: { status: 'COMPLETED', raceEnd: race.raceEnd || new Date() } })
+    ])
 
-    results.forEach(r => {
-        resultMap[r.driverId] = r
-
-        if (r.driver?.constructorId) {
-            constructorPoints[r.driver.constructorId] =
-                (constructorPoints[r.driver.constructorId] || 0) + getDriverPoints(r)
-        }
-    })
-
-    // Get all teams for this race
-    const teams = await client.team.findMany({
-        where: { raceId },
-        include: { predictions: true }
-    })
-
-    console.log(`[scoring] found ${teams.length} teams for race ${raceId}`)
-
-    // Clear previous points for this race
-    await client.points.deleteMany({ where: { raceId } })
-
-    const pointsData = []
-
-    for (const team of teams) {
-        let total = 0
-        const breakdown = {
-            drivers: {},
-            constructor: {
-                constructorId: team.constructorId,
-                points: team.constructorId ? constructorPoints[team.constructorId] || 0 : 0
-            }
-        }
-
-        for (const pred of team.predictions) {
-            const result = resultMap[pred.driverId]
-            if (!result) continue
-
-            const pts = getDriverPoints(result)
-            breakdown.drivers[pred.driverId] = pts
-            total += pts
-        }
-
-        total += breakdown.constructor.points
-
-        pointsData.push({
-            userId: team.userId,
-            raceId: team.raceId,
-            leagueId: team.leagueId,
-            totalPts: total,
-            breakdown
-        })
-    }
-
-    if (pointsData.length > 0) {
-        try {
-            await client.points.createMany({ data: pointsData })
-            console.log(`[scoring] created ${pointsData.length} points rows for race ${raceId}`)
-        } catch (err) {
-            console.error('[scoring] failed to create points:', err)
-            throw err
-        }
-    } else {
-        console.log(`[scoring] no points to create for race ${raceId}`)
-    }
+    await calculateRacePoints(raceId)
 }
 
-export default { getDriverPoints, calculateRacePoints }
+export default { getDriverPoints, calculateRacePoints, saveRaceResults }

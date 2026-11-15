@@ -1,36 +1,19 @@
-import 'dotenv/config';
-import express from 'express';
-import cors from 'cors';
+import 'dotenv/config'
+import { createApp } from './src/app.js'
+import { startAutoLockJob } from './src/jobs/autoLock.js'
+import { startRealDataJobs, startReminderJob } from './src/jobs/realData.js'
+import { recoverInterruptedRaces } from './src/live/raceRunner.js'
 
-import authRoutes from './src/api/auth/auth.routes.js';
-import userRoutes from './src/api/users/users.routes.js';
-import leagueRoutes from './src/api/leagues/leauges.routes.js';
-import teamRoutes from './src/api/teams/teams.routes.js';
-import raceRoutes from './src/api/races/races.routes.js';
-import resultRoutes from './src/api/results/results.routes.js';
-import leaderboardRoutes from './src/api/leaderboard/leaderboard.routes.js';
-import driverRoutes from './src/api/drivers/drivers.routes.js';
-import constructorRoutes from './src/api/constructors/constructors.routes.js';
-import adminRoutes from './src/api/admin/admin.routes.js';
-import simulationRoutes from './src/api/simulation/simulation.routes.js';
+const PORT = Number(process.env.PORT) || 4000
 
-const app = express();
-
-app.use(cors());
-app.use(express.json());
-
-app.use('/auth', authRoutes);
-app.use('/users', userRoutes);
-app.use('/leagues', leagueRoutes);
-app.use('/teams', teamRoutes);
-app.use('/races', raceRoutes);
-app.use('/results', resultRoutes);
-app.use('/leaderboard', leaderboardRoutes);
-app.use('/drivers', driverRoutes);
-app.use('/constructors', constructorRoutes);
-app.use('/admin', adminRoutes);
-app.use('/simulation', simulationRoutes);
-
-app.listen(4000, () => {
-    console.log('Server running on port 4000');
-});
+createApp().listen(PORT, async () => {
+    console.log(`Server running on port ${PORT}`)
+    try {
+        await recoverInterruptedRaces()
+    } catch (err) {
+        console.error('[startup] could not recover interrupted races:', err.message)
+    }
+    startAutoLockJob()
+    startReminderJob()
+    startRealDataJobs()
+})

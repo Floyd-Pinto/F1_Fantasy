@@ -21,10 +21,11 @@ model User {
   created_at DateTime @default(now())
   role       Role     @default(USER)
 
-  ownedLeagues League[]       @relation("LeagueOwner")
-  memberships  LeagueMember[]
-  teams        Team[]
-  points       Points[]
+  ownedLeagues      League[]           @relation("LeagueOwner")
+  memberships       LeagueMember[]
+  teams             Team[]
+  points            Points[]
+  pushSubscriptions PushSubscription[]
 }
 
 enum LeagueType {
@@ -63,14 +64,25 @@ model Driver {
   number Int?
   active Boolean @default(true)
 
-  price  Float @default(10.0) // ✅ ADD THIS
-  points Int   @default(0) // ✅ OPTIONAL (useful for UI)
+  price  Float @default(10.0) // fantasy price ($M)
+  points Int   @default(0) // real championship points (synced)
+
+  // Real-world data synced from Jolpica-F1 / OpenF1
+  externalId           String? @unique @db.VarChar(64) // Jolpica driverId, e.g. "max_verstappen"
+  code                 String? @db.VarChar(3) // e.g. "VER"
+  nationality          String? @db.VarChar(50)
+  headshotUrl          String? @db.VarChar(500)
+  wikiUrl              String? @db.VarChar(300) // Wikipedia article (from Jolpica), used for fallback photos
+  wins                 Int     @default(0)
+  championshipPosition Int?
 
   constructorId Int?
   constructor   Constructor? @relation(fields: [constructorId], references: [id])
 
-  predictions Prediction[]
-  raceResults RaceResult[]
+  predictions    Prediction[]
+  raceResults    RaceResult[]
+  captainOf      Team[]          @relation("TeamCaptain")
+  priceSnapshots PriceSnapshot[]
 }
 
 model Constructor {
@@ -78,8 +90,16 @@ model Constructor {
   name   String  @db.VarChar(100)
   active Boolean @default(true)
 
-  price  Float @default(10.0) // ✅ ADD THIS
-  points Int   @default(0) // ✅ OPTIONAL
+  price  Float @default(10.0) // fantasy price ($M)
+  points Int   @default(0) // real championship points (synced)
+
+  externalId           String? @unique @db.VarChar(64) // Jolpica constructorId, e.g. "red_bull"
+  nationality          String? @db.VarChar(50)
+  teamPrincipal        String? @db.VarChar(100)
+  color                String? @db.VarChar(6) // hex without '#', from OpenF1
+  logoUrl              String? @db.VarChar(500) // from Wikipedia on first sync; editable by admins
+  wins                 Int     @default(0)
+  championshipPosition Int?
 
   drivers Driver[]
   teams   Team[]
@@ -101,12 +121,38 @@ model Race {
   raceStart DateTime
   raceEnd   DateTime?
 
-  status      RaceStatus   @default(SCHEDULED)
-  teams       Team[]
-  raceResults RaceResult[]
-  points      Points[]
+  // Fantasy teams lock at the first scoring session of the weekend (qualifying, or the sprint).
+  lockAt          DateTime?
+  qualifyingStart DateTime?
+  sprintStart     DateTime?
+  carryOverDone   Boolean   @default(false)
+  reminderSent    Boolean   @default(false)
 
+  round            Int?
+  country          String? @db.VarChar(100)
+  locality         String? @db.VarChar(100)
+  totalLaps        Int?
+  openf1SessionKey Int? // OpenF1 race session, used for real replay / live timing
+
+  status         RaceStatus      @default(SCHEDULED)
+  replay         RaceReplay?
+  teams          Team[]
+  raceResults    RaceResult[]
+  points         Points[]
+  priceSnapshots PriceSnapshot[]
+
+  @@unique([season, round])
   @@index([season, raceDate])
+}
+
+// Lap-by-lap replay of a finished real race, built once from OpenF1 timing data and cached.
+model RaceReplay {
+  raceId    Int      @id
+  frames    Json
+  totalLaps Int
+  createdAt DateTime @default(now())
+
+  race Race @relation(fields: [raceId], references: [id], onDelete: Cascade)
 }
 
 model Team {
@@ -116,11 +162,14 @@ model Team {
   leagueId      Int
   locked        Boolean @default(false)
   constructorId Int?
+  captainId     Int? // this driver's points are doubled
+  carriedOver   Boolean @default(false) // copied from the player's previous race at lock time
   user          User    @relation(fields: [userId], references: [id])
   race          Race    @relation(fields: [raceId], references: [id])
   league        League  @relation(fields: [leagueId], references: [id])
 
   constructor Constructor? @relation(fields: [constructorId], references: [id])
+  captain     Driver?      @relation("TeamCaptain", fields: [captainId], references: [id])
 
   predictions Prediction[]
 
@@ -152,6 +201,10 @@ model RaceResult {
   dnf            Boolean @default(false)
   fastestLap     Boolean @default(false)
 
+  qualiPosition  Int?
+  sprintPosition Int?
+  sprintDnf      Boolean @default(false)
+
   race   Race   @relation(fields: [raceId], references: [id], onDelete: Cascade)
   driver Driver @relation(fields: [driverId], references: [id], onDelete: Cascade)
 
@@ -180,4 +233,34 @@ model Points {
 enum Role {
   USER
   ADMIN
+}
+
+// Fantasy price of a driver after each round, for price-history charts.
+model PriceSnapshot {
+  id       Int   @id @default(autoincrement())
+  driverId Int
+  raceId   Int
+  price    Float
+
+  driver Driver @relation(fields: [driverId], references: [id], onDelete: Cascade)
+  race   Race   @relation(fields: [raceId], references: [id], onDelete: Cascade)
+
+  @@unique([driverId, raceId])
+}
+
+// Browser push subscription (Web Push) for lock-time reminders.
+model PushSubscription {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  endpoint  String   @unique @db.VarChar(1000)
+  keys      Json
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+// Small key/value store for app-generated settings (e.g. Web Push VAPID keys).
+model AppSetting {
+  key   String @id @db.VarChar(100)
+  value String
 }

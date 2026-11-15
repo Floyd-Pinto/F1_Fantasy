@@ -5,9 +5,9 @@ import { isAdmin } from '../middleware/admin.middleware.js'
 
 const router = express.Router()
 
-// All simulation control endpoints are admin-protected
-router.post('/start/:raceId', protect, isAdmin, startSimulation)
-router.post('/stop/:raceId', protect, isAdmin, stopSimulationController)
-router.get('/:raceId/status', protect, isAdmin, getSimulationStatus)
+router.use(protect, isAdmin)
+router.post('/start/:raceId', startSimulation)
+router.post('/stop/:raceId', stopSimulationController)
+router.get('/:raceId/status', getSimulationStatus)
 
 export default router
