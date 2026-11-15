@@ -9,14 +9,14 @@ export function Leaderboard() {
 
   useEffect(() => {
     let mounted = true;
-    let intervalId: number | undefined;
 
-    async function load() {
-      setLoading(true);
+    async function load(first = false) {
+      if (first) setLoading(true);
       try {
         const res = await api.get('/leaderboard/global');
         if (!mounted) return;
         setData(res);
+        setError(null);
       } catch (err: any) {
         if (!mounted) return;
         setError(err?.message || 'Failed to load leaderboard');
@@ -25,14 +25,14 @@ export function Leaderboard() {
       }
     }
 
-    load();
-    // Poll while component mounted so leaderboards update during simulations
-    intervalId = window.setInterval(load, 3000);
+    load(true);
+    // Light polling keeps the global table fresh during live races.
+    const intervalId = window.setInterval(() => !document.hidden && load(), 10000);
 
-    return () => { mounted = false; if (intervalId) clearInterval(intervalId); };
+    return () => { mounted = false; clearInterval(intervalId); };
   }, []);
 
-  const top = data?.top5 || [];
+  const top = data?.top || [];
   const top1 = data?.max_overall || top[0] || null;
   const totalPlayers = data?.total_players ?? '-';
   const user = data?.user || null;
@@ -52,12 +52,12 @@ export function Leaderboard() {
           <p className="font-mono text-yellow-400 font-bold">{top1 ? Number(top1.totalPts).toLocaleString() : '—'} PTS</p>
         </div>
 
-        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 flex flex-col justify-center">
+        <div className="surface p-6 flex flex-col justify-center">
           <h3 className="text-zinc-400 font-bold text-sm uppercase mb-1">Total Players</h3>
           <p className="text-3xl font-bold text-white mb-1">{loading ? '…' : totalPlayers.toLocaleString?.() ?? totalPlayers}</p>
         </div>
 
-        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 flex flex-col justify-center">
+        <div className="surface p-6 flex flex-col justify-center">
           <h3 className="text-zinc-400 font-bold text-sm uppercase mb-1">Your Global Rank</h3>
           <div className="flex items-end gap-3">
             <p className="text-3xl font-bold text-white">{user ? user.rank : '—'}</p>
@@ -70,11 +70,11 @@ export function Leaderboard() {
       </div>
 
       {data?.current_race && (
-        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
+        <div className="surface p-4">
           <div className="flex items-center justify-between">
             <div>
               <div className="text-xs text-zinc-400 uppercase tracking-wide">Current Race Top</div>
-              <div className="font-medium text-white">{data.current_race.name} (#{data.current_race.raceId})</div>
+              <div className="font-medium text-white">{data.current_race.name}{data.current_race.status === "ONGOING" ? " · live" : ""}</div>
               <div className="text-xs text-zinc-400">Top points: {data.current_race.maxPoints}</div>
             </div>
             <div>
@@ -86,7 +86,9 @@ export function Leaderboard() {
         </div>
       )}
 
-      <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden">
+      {error && <div className="bg-red-950/30 border border-red-900/50 text-red-300 rounded-xl p-4 text-sm">{error}</div>}
+
+      <div className="surface overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse min-w-[600px]">
             <thead>
@@ -100,6 +102,7 @@ export function Leaderboard() {
             <tbody className="divide-y divide-zinc-800/50">
               {top.map((user: any, index: number) => {
                 const isCurrentUser = user.userId === data?.user?.userId;
+                const rank = user.rank ?? index + 1;
                 return (
                   <tr
                     key={user.userId}
@@ -107,14 +110,10 @@ export function Leaderboard() {
                   >
                     <td className="px-6 py-4">
                       <div className="flex justify-center items-center gap-2">
-                        {index === 0 ? (
-                          <Trophy className="w-5 h-5 text-yellow-500" />
-                        ) : index === 1 ? (
-                          <Trophy className="w-5 h-5 text-zinc-300" />
-                        ) : index === 2 ? (
-                          <Trophy className="w-5 h-5 text-amber-700" />
+                        {rank <= 3 && user.totalPts > 0 ? (
+                          <Trophy className={`w-5 h-5 ${["text-yellow-500", "text-zinc-300", "text-amber-700"][rank - 1]}`} />
                         ) : (
-                          <span className="font-bold text-zinc-500 w-5 text-center">{index + 1}</span>
+                          <span className="font-bold text-zinc-500 w-5 text-center">{rank}</span>
                         )}
                       </div>
                     </td>
@@ -131,7 +130,7 @@ export function Leaderboard() {
                       </div>
                     </td>
                     <td className="px-6 py-4 text-center hidden sm:table-cell text-zinc-400 font-mono">
-                      —
+                      {user.racesPlayed ?? "—"}
                     </td>
                     <td className="px-6 py-4 text-right">
                       <span className="font-mono font-bold text-white">{Number(user.totalPts).toLocaleString()}</span>

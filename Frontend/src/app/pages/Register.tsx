@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { Link, useNavigate } from "react-router";
-import { api } from "../api";
+import { api, session } from "../api";
+import { AuthShell } from "../components/AuthShell";
+
 export function Register() {
   const navigate = useNavigate();
   const [error, setError] = useState("");
@@ -19,7 +21,10 @@ export function Register() {
       setError("");
 
       await api.post("/auth/register", formData);
-      navigate("/login");
+      // Sign straight in after registering.
+      const result = await api.post("/auth/login", { email: formData.email, password: formData.password });
+      session.save(result);
+      navigate("/", { replace: true });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Registration failed");
     } finally {
@@ -32,17 +37,8 @@ export function Register() {
   };
 
   return (
-    <div className="min-h-screen bg-zinc-950 flex flex-col items-center justify-center p-4">
-      <div className="w-full max-w-md">
-        <div className="flex flex-col items-center mb-8">
-          <div className="w-12 h-12 rounded bg-red-600 flex items-center justify-center font-bold text-white italic text-xl mb-4">
-            F1
-          </div>
-          <h1 className="text-3xl font-bold text-white uppercase italic tracking-tight">Join The Race</h1>
-          <p className="text-zinc-400 mt-2">Create your fantasy account</p>
-        </div>
-
-        <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-6 md:p-8 shadow-xl">
+    <AuthShell title="Join the grid" subtitle="Create your account and build your first team.">
+        <div className="surface p-6 md:p-8">
           <form onSubmit={handleSubmit} className="space-y-4">
             {error && (
               <div className="bg-red-950/30 border border-red-900/50 text-red-300 rounded-lg p-3 text-sm">
@@ -58,7 +54,7 @@ export function Register() {
                 required
                 value={formData.username}
                 onChange={handleChange}
-                className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-3 text-white placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-red-600 focus:border-transparent transition-all"
+                className="w-full bg-zinc-950/80 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-red-600 focus:border-transparent transition-all"
                 placeholder="SpeedRacer99"
               />
             </div>
@@ -70,7 +66,7 @@ export function Register() {
                 required
                 value={formData.email}
                 onChange={handleChange}
-                className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-3 text-white placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-red-600 focus:border-transparent transition-all"
+                className="w-full bg-zinc-950/80 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-red-600 focus:border-transparent transition-all"
                 placeholder="name@example.com"
               />
             </div>
@@ -82,7 +78,7 @@ export function Register() {
                 required
                 value={formData.phone_no}
                 onChange={handleChange}
-                className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-3 text-white placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-red-600 focus:border-transparent transition-all"
+                className="w-full bg-zinc-950/80 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-red-600 focus:border-transparent transition-all"
                 placeholder="+1 (555) 000-0000"
               />
             </div>
@@ -92,10 +88,11 @@ export function Register() {
                 type="password"
                 name="password"
                 required
+                minLength={8}
                 value={formData.password}
                 onChange={handleChange}
-                className="w-full bg-zinc-950 border border-zinc-800 rounded-lg px-4 py-3 text-white placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-red-600 focus:border-transparent transition-all"
-                placeholder="••••••••"
+                className="w-full bg-zinc-950/80 border border-white/10 rounded-xl px-4 py-3 text-white placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-red-600 focus:border-transparent transition-all"
+                placeholder="At least 8 characters"
               />
             </div>
 
@@ -103,11 +100,10 @@ export function Register() {
               <button
                 type="submit"
                 disabled={loading}
-                className="w-full bg-red-600 hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold py-3 px-4 rounded-lg transition-colors"
+                className="w-full bg-red-600 hover:bg-red-500 shadow-lg shadow-red-950/40 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold py-3 px-4 rounded-xl transition-colors"
               >
                 {loading ? "Creating Account..." : "Create Account"}
               </button>
-              
             </div>
           </form>
 
@@ -118,7 +114,6 @@ export function Register() {
             </Link>
           </div>
         </div>
-      </div>
-    </div>
+    </AuthShell>
   );
 }

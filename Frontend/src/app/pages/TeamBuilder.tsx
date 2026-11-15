@@ -1,28 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
 import { useParams, Link } from "react-router";
-import { Lock, Check, CircleAlert, ChevronLeft } from "lucide-react";
-import { api } from "../api";
-
-type Driver = {
-  id: number;
-  name: string;
-  price: number;
-  active: boolean;
-  constructor?: {
-    name: string;
-  } | null;
-};
-
-type Constructor = {
-  id: number;
-  name: string;
-  price: number;
-  active: boolean;
-};
+import { Lock, Check, CircleAlert, ChevronLeft, Crown, Repeat, Target } from "lucide-react";
+import { api, ApiError } from "../api";
+import type { Constructor, Driver } from "../types";
+import { DriverAvatar, TeamLogo, TeamStripe } from "../components/common";
+import { formatDateTime, timeUntil } from "../format";
 
 type Race = {
   id: number;
   name: string;
+  raceStart: string;
+  lockAt?: string | null;
+  sprintStart?: string | null;
+  status: string;
   team_locked?: boolean;
 };
 
@@ -33,11 +23,31 @@ type League = {
 
 type SavedTeam = {
   locked: boolean;
-  drivers: string[];
-  constructor?: string | null;
+  driverIds: number[];
+  constructorId: number | null;
+  captainId: number | null;
+  carriedOver?: boolean;
+  predictions: { driverId: number; predictedPosition: number | null }[];
+  fromRace?: string;
 };
 
 const DEFAULT_PRICE = 10.0;
+
+// Championship points per $M — the "bang for buck" when building under budget.
+const value = (d: Driver) => d.points / d.price;
+
+type SortKey = "priceDesc" | "priceAsc" | "value" | "team";
+
+const SORTS: Record<SortKey, { label: string; title: string; compare: (a: Driver, b: Driver) => number }> = {
+  priceDesc: { label: "Price ↓", title: "Most expensive first", compare: (a, b) => b.price - a.price },
+  priceAsc: { label: "Price ↑", title: "Cheapest first", compare: (a, b) => a.price - b.price },
+  value: { label: "Value", title: "Championship points per $M", compare: (a, b) => value(b) - value(a) || b.points - a.points },
+  team: {
+    label: "Team",
+    title: "Grouped by team",
+    compare: (a, b) => (a.constructor?.name || "").localeCompare(b.constructor?.name || "") || b.price - a.price,
+  },
+};
 
 function normalizePrice(value: unknown) {
   const price = typeof value === "number" ? value : Number(value);
@@ -57,8 +67,22 @@ export function TeamBuilder() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  
-  const BUDGET = 100.0;
+  const [BUDGET, setBudget] = useState(100);
+  // Prices are derived from championship position, so "price" and "points" would give the same
+  // order — offer sorts that actually differ instead.
+  const [sort, setSort] = useState<SortKey>("priceDesc");
+  const [captain, setCaptain] = useState<string | null>(null);
+  const [predictions, setPredictions] = useState<Record<string, number | null>>({});
+  const [carriedOver, setCarriedOver] = useState(false);
+
+  const applyTeam = (team: SavedTeam, withPredictions: boolean) => {
+    setSelectedDrivers(team.driverIds.map(String));
+    setSelectedConstructor(team.constructorId ? String(team.constructorId) : null);
+    setCaptain(team.captainId ? String(team.captainId) : null);
+    setPredictions(
+      withPredictions ? Object.fromEntries(team.predictions.map((p) => [String(p.driverId), p.predictedPosition])) : {}
+    );
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -75,19 +99,21 @@ export function TeamBuilder() {
         setError("");
         setNotice("");
 
-        const [leagueData, raceData, driverData, constructorData] = await Promise.all([
+        const [leagueData, raceData, driverData, constructorData, config] = await Promise.all([
           api.get(`/leagues/${leagueId}`),
           api.get(`/races/${raceId}`),
-          api.get("/drivers"),
-          api.get("/constructors"),
+          api.get("/drivers?active=true"),
+          api.get("/constructors?active=true"),
+          api.get("/config").catch(() => null),
         ]);
+        if (config?.teamBudget) setBudget(config.teamBudget);
 
         let savedTeam: SavedTeam | null = null;
 
         try {
           savedTeam = await api.get(`/teams/${raceId}?leagueId=${leagueId}`);
         } catch (err) {
-          if (!(err instanceof Error) || err.message !== "No team found") {
+          if (!(err instanceof ApiError && err.status === 404)) {
             throw err;
           }
         }
@@ -114,20 +140,19 @@ export function TeamBuilder() {
         setConstructors(activeConstructors);
 
         if (savedTeam) {
-          const selectedDriverIds = savedTeam.drivers
-            .map((name) => activeDrivers.find((driver) => driver.name === name)?.id)
-            .filter((id): id is number => id !== undefined)
-            .map(String);
-
-          const selectedConstructorId = savedTeam.constructor
-            ? activeConstructors.find((constructor) => constructor.name === savedTeam.constructor)?.id
-            : undefined;
-
-          setSelectedDrivers(selectedDriverIds);
-          setSelectedConstructor(selectedConstructorId ? String(selectedConstructorId) : null);
+          applyTeam(savedTeam, true);
+          setCarriedOver(Boolean(savedTeam.carriedOver));
           setIsLocked(savedTeam.locked || Boolean(raceData.team_locked));
         } else {
           setIsLocked(Boolean(raceData.team_locked));
+          // No team yet: start from last race's team (predictions are race-specific, so not copied).
+          if (!raceData.team_locked) {
+            const previous: SavedTeam | null = await api.get(`/teams/previous/${raceId}?leagueId=${leagueId}`).catch(() => null);
+            if (previous && !cancelled) {
+              applyTeam(previous, false);
+              setNotice(`Prefilled with your team from ${previous.fromRace}. Save to confirm it, or change it. If you don't, it carries over automatically.`);
+            }
+          }
         }
       } catch (err) {
         if (!cancelled) {
@@ -145,6 +170,10 @@ export function TeamBuilder() {
     };
   }, [leagueId, raceId]);
   
+  const sortedDrivers = useMemo(
+    () => [...drivers].sort(SORTS[sort].compare),
+    [drivers, sort]
+  );
   const driverById = useMemo(() => new Map(drivers.map((driver) => [String(driver.id), driver])), [drivers]);
   const constructorById = useMemo(() => new Map(constructors.map((constructor) => [String(constructor.id), constructor])), [constructors]);
 
@@ -155,12 +184,16 @@ export function TeamBuilder() {
   
   const remainingBudget = BUDGET - currentCost;
   const isComplete = selectedDrivers.length === 5 && selectedConstructor !== null;
+  const predicted = selectedDrivers.map((id) => predictions[id]).filter((p): p is number => p != null);
+  const duplicatePrediction = new Set(predicted).size !== predicted.length;
   const isOverBudget = remainingBudget < 0;
 
   const toggleDriver = (id: string) => {
     if (isLocked) return;
     if (selectedDrivers.includes(id)) {
       setSelectedDrivers(selectedDrivers.filter(dId => dId !== id));
+      if (captain === id) setCaptain(null);
+      setPredictions(({ [id]: _, ...rest }) => rest);
     } else {
       if (selectedDrivers.length < 5) {
         setSelectedDrivers([...selectedDrivers, id]);
@@ -168,13 +201,10 @@ export function TeamBuilder() {
     }
   };
 
+  // Picking another constructor swaps it in directly.
   const toggleConstructor = (id: string) => {
     if (isLocked) return;
-    if (selectedConstructor === id) {
-      setSelectedConstructor(null);
-    } else {
-      setSelectedConstructor(id);
-    }
+    setSelectedConstructor(selectedConstructor === id ? null : id);
   };
 
   const saveTeam = async () => {
@@ -188,11 +218,13 @@ export function TeamBuilder() {
       await api.post("/teams/build", {
         leagueId: Number(leagueId),
         raceId: Number(raceId),
-        driverIds: selectedDrivers.map(Number),
+        predictions: selectedDrivers.map((id) => ({ driverId: Number(id), predictedPosition: predictions[id] ?? null })),
         constructorId: Number(selectedConstructor),
+        captainId: captain ? Number(captain) : null,
       });
 
-      setNotice("Team saved.");
+      setCarriedOver(false);
+      setNotice("Team saved. You can keep editing until the team lock.");
       return true;
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to save team");
@@ -210,6 +242,7 @@ export function TeamBuilder() {
       setError("");
       setNotice("");
 
+      if (!window.confirm("Locking is final — you won't be able to change this team. Lock it?")) return;
       const saved = await saveTeam();
       if (!saved) return;
 
@@ -260,7 +293,13 @@ export function TeamBuilder() {
             {race.name}
           </div>
           <h1 className="text-3xl font-bold uppercase italic tracking-tight">Team Builder</h1>
-          <p className="text-zinc-400 mt-1">Select 5 drivers and 1 constructor within the $100M budget.</p>
+          <p className="text-zinc-400 mt-1">Select 5 drivers and 1 constructor within the ${BUDGET}M budget.</p>
+          {!isLocked && (
+            <p className="text-xs text-zinc-500 mt-1">
+              Teams lock when {race.sprintStart ? "the sprint weekend" : "qualifying"} starts: {formatDateTime(race.lockAt || race.raceStart)} (in{" "}
+              {timeUntil(race.lockAt || race.raceStart)}). <Link to="/rules" className="text-red-400 hover:text-red-300">Scoring rules</Link>
+            </p>
+          )}
         </div>
         
         <div className="flex items-center gap-3 bg-zinc-900 px-4 py-2.5 rounded-xl border border-zinc-800">
@@ -275,6 +314,13 @@ export function TeamBuilder() {
         <div className="bg-amber-950/30 border border-amber-900/50 text-amber-500 p-4 rounded-xl flex items-center gap-3">
           <Lock className="w-5 h-5" />
           <p className="font-medium">Your team is locked for {race.name}. Editing is disabled.</p>
+        </div>
+      )}
+
+      {carriedOver && (
+        <div className="bg-blue-950/20 border border-blue-900/40 text-blue-300 p-4 rounded-xl flex items-center gap-3 text-sm">
+          <Repeat className="w-5 h-5 shrink-0" />
+          You didn't pick a team for this race, so your previous team carried over automatically.
         </div>
       )}
 
@@ -297,9 +343,16 @@ export function TeamBuilder() {
           <section>
             <div className="flex items-center justify-between mb-4">
               <h2 className="text-xl font-bold uppercase italic">Drivers ({selectedDrivers.length}/5)</h2>
+              <div className="flex gap-1 text-xs">
+                {(Object.keys(SORTS) as SortKey[]).map((k) => (
+                  <button key={k} onClick={() => setSort(k)} title={SORTS[k].title} className={`px-2.5 py-1 rounded ${sort === k ? "bg-zinc-700 text-white" : "text-zinc-400 hover:text-white"}`}>
+                    {SORTS[k].label}
+                  </button>
+                ))}
+              </div>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              {drivers.map(driver => {
+              {sortedDrivers.map(driver => {
                 const driverId = String(driver.id);
                 const isSelected = selectedDrivers.includes(driverId);
                 return (
@@ -313,9 +366,14 @@ export function TeamBuilder() {
                         : "bg-zinc-900 border-zinc-800 hover:border-zinc-600 disabled:opacity-50 disabled:hover:border-zinc-800"
                     }`}
                   >
-                    <div>
-                      <div className="font-bold text-white">{driver.name}</div>
-                      <div className="text-xs text-zinc-500 uppercase font-medium mt-1">{driver.constructor?.name || "No constructor"}</div>
+                    <div className="flex items-center gap-3 min-w-0">
+                      <DriverAvatar url={driver.headshotUrl} name={driver.name} color={driver.constructor?.color} />
+                      <div className="min-w-0">
+                        <div className="font-bold text-white truncate">{driver.name}</div>
+                        <div className="text-xs text-zinc-500 uppercase font-medium mt-0.5">
+                          {driver.constructor?.name || "No constructor"} · {driver.points} pts
+                        </div>
+                      </div>
                     </div>
                     <div className="text-right">
                       <div className="font-mono font-bold text-zinc-300">${driver.price.toFixed(1)}M</div>
@@ -343,15 +401,20 @@ export function TeamBuilder() {
                   <button
                     key={constructor.id}
                     onClick={() => toggleConstructor(constructorId)}
-                    disabled={isLocked || (!isSelected && selectedConstructor !== null)}
+                    disabled={isLocked}
                     className={`flex items-center justify-between p-4 rounded-xl border text-left transition-all ${
                       isSelected 
                         ? "bg-blue-950/20 border-blue-600" 
                         : "bg-zinc-900 border-zinc-800 hover:border-zinc-600 disabled:opacity-50 disabled:hover:border-zinc-800"
                     }`}
                   >
-                    <div>
-                      <div className="font-bold text-white">{constructor.name}</div>
+                    <div className="flex items-center gap-3">
+                      <TeamStripe color={constructor.color} />
+                      <TeamLogo url={constructor.logoUrl} name={constructor.name} size={36} />
+                      <div>
+                        <div className="font-bold text-white">{constructor.name}</div>
+                        <div className="text-xs text-zinc-500">{constructor.teamPrincipal || ""} · {constructor.points} pts</div>
+                      </div>
                     </div>
                     <div className="text-right">
                       <div className="font-mono font-bold text-zinc-300">${constructor.price.toFixed(1)}M</div>
@@ -369,7 +432,7 @@ export function TeamBuilder() {
 
         {/* Team Summary Sidebar */}
         <div className="space-y-4 relative">
-          <div className="sticky top-24 bg-zinc-900 border border-zinc-800 rounded-xl p-6">
+          <div className="sticky top-24 surface p-6">
             <h3 className="text-lg font-bold uppercase italic mb-4 pb-4 border-b border-zinc-800">Your Lineup</h3>
             
             <div className="space-y-4 mb-6">
@@ -378,12 +441,45 @@ export function TeamBuilder() {
                 {Array.from({ length: 5 }).map((_, i) => {
                   const driverId = selectedDrivers[i];
                   const driver = driverId ? driverById.get(driverId) : null;
+                  const isCaptain = driverId && captain === driverId;
                   return (
-                    <div key={i} className="flex justify-between items-center py-2 border-b border-zinc-800/50 last:border-0">
-                      <span className={driver ? "text-white font-medium" : "text-zinc-600 italic"}>
-                        {driver ? driver.name : `Empty Slot ${i + 1}`}
-                      </span>
-                      {driver && <span className="text-xs font-mono text-zinc-400">${driver.price}M</span>}
+                    <div key={i} className="py-2 border-b border-zinc-800/50 last:border-0">
+                      <div className="flex justify-between items-center gap-2">
+                        <span className={`truncate ${driver ? "text-white font-medium" : "text-zinc-600 italic"}`}>
+                          {driver ? driver.name : `Empty Slot ${i + 1}`}
+                        </span>
+                        {driver && <span className="text-xs font-mono text-zinc-400 shrink-0">${driver.price.toFixed(1)}M</span>}
+                      </div>
+                      {driver && (
+                        <div className="flex items-center gap-2 mt-1.5">
+                          <button
+                            onClick={() => !isLocked && setCaptain(isCaptain ? null : driverId)}
+                            disabled={isLocked}
+                            title="Captain: this driver's points are doubled"
+                            className={`flex items-center gap-1 text-[11px] font-bold uppercase px-2 py-0.5 rounded border transition-colors ${
+                              isCaptain ? "bg-yellow-500/20 border-yellow-500/60 text-yellow-300" : "border-zinc-700 text-zinc-500 hover:text-zinc-200"
+                            }`}
+                          >
+                            <Crown className="w-3 h-3" /> {isCaptain ? "Captain ×2" : "Captain"}
+                          </button>
+                          <label className="flex items-center gap-1 text-[11px] text-zinc-500" title="Predict the finishing position: exact +5, one off +2">
+                            <Target className="w-3 h-3" />
+                            <select
+                              value={predictions[driverId] ?? ""}
+                              disabled={isLocked}
+                              onChange={(e) => setPredictions({ ...predictions, [driverId]: e.target.value ? Number(e.target.value) : null })}
+                              className="bg-zinc-950 border border-zinc-800 rounded px-1 py-0.5 text-[11px] text-zinc-200"
+                            >
+                              <option value="">Predict</option>
+                              {Array.from({ length: Math.max(20, drivers.length) }, (_, p) => (
+                                <option key={p + 1} value={p + 1}>
+                                  P{p + 1}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -397,7 +493,7 @@ export function TeamBuilder() {
                   </span>
                   {selectedConstructor && (
                     <span className="text-xs font-mono text-zinc-400">
-                      ${constructorById.get(selectedConstructor)?.price}M
+                      ${constructorById.get(selectedConstructor)?.price.toFixed(1)}M
                     </span>
                   )}
                 </div>
@@ -411,6 +507,20 @@ export function TeamBuilder() {
               </div>
             )}
 
+            {isComplete && !captain && !isLocked && (
+              <div className="bg-yellow-950/20 border border-yellow-900/30 text-yellow-500/80 p-3 rounded-lg text-sm flex items-start gap-2 mb-4">
+                <Crown className="w-4 h-4 mt-0.5 shrink-0" />
+                <p>Tip: pick a captain to double one driver's points.</p>
+              </div>
+            )}
+
+            {duplicatePrediction && (
+              <div className="bg-red-950/20 border border-red-900/30 text-red-500/80 p-3 rounded-lg text-sm flex items-start gap-2 mb-4">
+                <CircleAlert className="w-4 h-4 mt-0.5 shrink-0" />
+                <p>Two drivers can't be predicted in the same position.</p>
+              </div>
+            )}
+
             {isOverBudget && (
               <div className="bg-red-950/20 border border-red-900/30 text-red-500/80 p-3 rounded-lg text-sm flex items-start gap-2 mb-4">
                 <CircleAlert className="w-4 h-4 mt-0.5 shrink-0" />
@@ -421,18 +531,18 @@ export function TeamBuilder() {
             <div className="space-y-3">
               <button
                 onClick={saveTeam}
-                disabled={!isComplete || isOverBudget || isLocked || saving}
+                disabled={!isComplete || isOverBudget || duplicatePrediction || isLocked || saving}
                 className="w-full bg-zinc-800 hover:bg-zinc-700 text-white font-semibold py-3 px-4 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {saving ? "Saving..." : "Save Team"}
               </button>
               <button
                 onClick={lockTeam}
-                disabled={!isComplete || isOverBudget || isLocked || saving}
+                disabled={!isComplete || isOverBudget || duplicatePrediction || isLocked || saving}
                 className={`w-full font-semibold py-3 px-4 rounded-lg transition-colors flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed ${
                   isLocked 
                     ? "bg-zinc-800 hover:bg-zinc-700 text-zinc-300" 
-                    : "bg-red-600 hover:bg-red-700 text-white"
+                    : "bg-red-600 hover:bg-red-500 shadow-lg shadow-red-950/40 text-white"
                 }`}
               >
                 <Lock className="w-4 h-4" />

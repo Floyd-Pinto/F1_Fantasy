@@ -1,369 +1,343 @@
 import { useEffect, useState } from "react";
-import { useNavigate } from "react-router";
-import { api } from "../api";
-import { GripVertical } from "lucide-react";
+import { Navigate, Link } from "react-router";
+import { GripVertical, RefreshCw, Play, Square, Radio, FlaskConical } from "lucide-react";
+import { api, session } from "../api";
+import type { Constructor, Driver, Race, ResultRow } from "../types";
+import { ErrorBox, Notice, StatusBadge, TeamLogo } from "../components/common";
+import { formatDate } from "../format";
+
+type EditRow = { driverId: number; driverName: string; fastest_lap: boolean; dnf: boolean; points?: number };
+type AdminUser = { id: number; username: string; email: string; role: "USER" | "ADMIN" };
+type SimStatus = { running: boolean; mode: string | null; lap: number | null; totalLaps: number | null; testRace: boolean };
 
 export function Admin() {
-    const [races, setRaces] = useState<any[]>([]);
-    const [users, setUsers] = useState<any[]>([]);
-    const [loading, setLoading] = useState(false);
-    const [selectedRaceId, setSelectedRaceId] = useState<number | null>(null);
-    const [results, setResults] = useState<any[]>([]);
-    const [saving, setSaving] = useState(false);
-    const [message, setMessage] = useState<string | null>(null);
-    const [draggingIndex, setDraggingIndex] = useState<number | null>(null);
-    const [raceMeta, setRaceMeta] = useState<any | null>(null);
-    const [simRunning, setSimRunning] = useState<boolean>(false);
-    const [simLoading, setSimLoading] = useState<boolean>(false);
-    const [simStatus, setSimStatus] = useState<string | null>(null);
+  if (!session.isAdmin()) return <Navigate to="/" replace />;
+  return <AdminPanel />;
+}
 
-    useEffect(() => {
-        loadRaces();
-        loadUsersIfAdmin();
-    }, []);
+function AdminPanel() {
+  const me = session.user();
+  const [races, setRaces] = useState<Race[]>([]);
+  const [users, setUsers] = useState<AdminUser[]>([]);
+  const [teams, setTeams] = useState<Constructor[]>([]);
+  const [selected, setSelected] = useState<Race | null>(null);
+  const [rows, setRows] = useState<EditRow[]>([]);
+  const [sim, setSim] = useState<SimStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [dragging, setDragging] = useState<number | null>(null);
 
-    const currentUserStr = typeof window !== 'undefined' ? localStorage.getItem('user') : null;
-    const currentUser = currentUserStr ? JSON.parse(currentUserStr) : null;
-    const isAdminUser = !!currentUser && (currentUser.role === 'ADMIN' || currentUser.username === 'admin');
-    const navigate = useNavigate();
-
-    useEffect(() => {
-        // Redirect non-admins away from the admin UI
-        if (!isAdminUser) {
-            navigate('/', { replace: true });
-        }
-    }, [isAdminUser, navigate]);
-
-    async function loadUsersIfAdmin() {
-        if (!isAdminUser) return;
-        try {
-            const res = await api.get('/admin/users');
-            setUsers(res || []);
-        } catch (err: any) {
-            console.error('Failed to load users', err);
-        }
+  const run = async (fn: () => Promise<unknown>, ok?: string) => {
+    setBusy(true);
+    setError("");
+    setMessage("");
+    try {
+      await fn();
+      if (ok) setMessage(ok);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Request failed");
+    } finally {
+      setBusy(false);
     }
+  };
 
-    async function loadRaces() {
-        setLoading(true);
-        try {
-            const res = await api.get('/races');
-            setRaces(res || []);
-        } catch (err: any) {
-            console.error('Failed to load races', err);
-            setMessage(err?.message || 'Failed to load races');
-        } finally {
-            setLoading(false);
-        }
+  const loadRaces = () => api.get<Race[]>("/races").then(setRaces);
+  const loadUsers = () => api.get<AdminUser[]>("/admin/users").then(setUsers);
+  const loadTeams = () => api.get<Constructor[]>("/constructors?active=true").then(setTeams);
+
+  useEffect(() => {
+    run(() => Promise.all([loadRaces(), loadUsers(), loadTeams()]));
+  }, []);
+
+  async function openRace(race: Race) {
+    setSelected(race);
+    await run(async () => {
+      const [results, status] = await Promise.all([api.get<ResultRow[]>(`/results/${race.id}`), api.get<SimStatus>(`/simulation/${race.id}/status`)]);
+      setSim(status);
+      if (results.length) {
+        setRows(results.map((r) => ({ driverId: r.driver_id, driverName: r.driver_name, fastest_lap: r.fastest_lap, dnf: r.dnf, points: r.points })));
+      } else {
+        // No results yet: start from the current grid ordered by championship position.
+        const drivers = await api.get<Driver[]>("/drivers?active=true");
+        setRows(drivers.map((d) => ({ driverId: d.id, driverName: d.name, fastest_lap: false, dnf: false })));
+      }
+    });
+  }
+
+  const refreshSelected = async () => {
+    await loadRaces();
+    if (selected) {
+      const fresh = (await api.get<Race>(`/races/${selected.id}`)) as Race;
+      await openRace(fresh);
     }
+  };
 
-    async function openRace(raceId: number) {
-        setSelectedRaceId(raceId);
-        setMessage(null);
-        try {
-            const [res, raceInfo] = await Promise.all([
-                api.get(`/results/${raceId}`),
-                api.get(`/races/${raceId}`)
-            ]);
+  const startRun = () =>
+    selected &&
+    run(async () => {
+      await api.post(`/simulation/start/${selected.id}`);
+      setSim(await api.get(`/simulation/${selected.id}/status`));
+      await loadRaces();
+    }, "Simulation started — open the live view to watch.");
 
-            // res: [{ driver_id, driver_name, finish_pos, fastest_lap, dnf, points }]
-            setResults((res || []).map((r: any) => ({
-                driverId: r.driver_id,
-                driverName: r.driver_name,
-                finish_pos: r.finish_pos,
-                fastest_lap: !!r.fastest_lap,
-                dnf: !!r.dnf,
-                points: r.points
-            })));
+  // Test races have no championship round, so simulations can never overwrite a real Grand Prix.
+  const createTestRace = () =>
+    run(async () => {
+      const start = new Date(Date.now() + 10 * 60 * 1000);
+      const race = await api.post<Race>("/races", {
+        name: `Test Race ${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`,
+        circuit: "Simulator",
+        season: start.getFullYear(),
+        raceDate: start.toISOString(),
+        raceStart: start.toISOString(),
+      });
+      await loadRaces();
+      await openRace(race);
+    }, "Test race created — it starts in 10 minutes, or simulate it now.");
 
-            setRaceMeta(raceInfo || null);
-            // fetch simulation status
-            try {
-                const status = await api.get(`/simulation/${raceId}/status`);
-                setSimRunning(!!status.running);
-                setSimStatus(status.status || null);
-            } catch (err) {
-                setSimRunning(false);
-                setSimStatus(null);
-            }
-        } catch (err: any) {
-            console.error('Failed to load results', err);
-            setMessage(err?.message || 'Failed to load results');
-        }
-    }
+  const stopRun = () =>
+    selected &&
+    run(async () => {
+      await api.post(`/simulation/stop/${selected.id}`);
+      await refreshSelected();
+    }, "Stopped — partial results discarded.");
 
-    function updateRow(idx: number, changes: Partial<any>) {
-        setResults(prev => prev.map((r, i) => (i === idx ? { ...r, ...changes } : r)));
-    }
+  const saveResults = () =>
+    selected &&
+    run(async () => {
+      await api.put(`/results/${selected.id}`, {
+        results: rows.map((r, i) => ({ driverId: r.driverId, finish_pos: r.dnf ? null : i + 1, fastest_lap: r.fastest_lap, dnf: r.dnf })),
+      });
+      await refreshSelected();
+    }, "Results saved and every team re-scored.");
 
-    function handleDragStart(e: React.DragEvent, idx: number) {
-        e.dataTransfer.effectAllowed = 'move';
-        e.dataTransfer.setData('text/plain', String(idx));
-        setDraggingIndex(idx);
-    }
+  const sync = () =>
+    run(async () => {
+      const s = await api.post("/admin/sync", {});
+      await Promise.all([loadRaces(), loadTeams()]);
+      setMessage(`Synced ${s.season}: ${s.races} races, ${s.resultsImported} new results imported.`);
+    });
 
-    function handleDragOver(e: React.DragEvent, idx: number) {
-        e.preventDefault();
-        e.dataTransfer.dropEffect = 'move';
-    }
+  const setFastestLap = (idx: number, on: boolean) => setRows((prev) => prev.map((r, i) => ({ ...r, fastest_lap: on ? i === idx : i === idx ? false : r.fastest_lap })));
 
-    function handleDrop(e: React.DragEvent, toIdx: number) {
-        e.preventDefault();
-        const from = Number(e.dataTransfer.getData('text/plain'));
-        const to = toIdx;
-        if (isNaN(from)) {
-            setDraggingIndex(null);
-            return;
-        }
-        if (from === to) {
-            setDraggingIndex(null);
-            return;
-        }
-        setResults(prev => {
-            const next = [...prev];
-            const [moved] = next.splice(from, 1);
-            next.splice(to, 0, moved);
-            // normalize finish_pos based on order
-            return next.map((r, i) => ({ ...r, finish_pos: i + 1 }));
-        });
-        setDraggingIndex(null);
-    }
+  const onDrop = (to: number) => {
+    if (dragging === null || dragging === to) return setDragging(null);
+    setRows((prev) => {
+      const next = [...prev];
+      const [moved] = next.splice(dragging, 1);
+      next.splice(to, 0, moved);
+      return next;
+    });
+    setDragging(null);
+  };
 
-    function handleDragEnd() {
-        setDraggingIndex(null);
-    }
+  const saveTeam = (team: Constructor, patch: Partial<Constructor>) =>
+    run(async () => {
+      await api.put(`/constructors/${team.id}`, patch);
+      await loadTeams();
+    }, `${team.name} updated.`);
 
-    async function saveResults() {
-        if (!selectedRaceId) return;
-        setSaving(true);
-        setMessage(null);
-        try {
-            const payload = {
-                results: results.map((r, idx) => ({
-                    driverId: r.driverId,
-                    finish_pos: Number(idx + 1),
-                    fastest_lap: !!r.fastest_lap,
-                    dnf: !!r.dnf
-                }))
-            };
-
-            await api.put(`/results/${selectedRaceId}`, payload);
-
-            // update done; server recalculates, but call calculate endpoint for safety
-            await api.post(`/results/calculate/${selectedRaceId}`);
-
-            setMessage('Results saved and recalculated');
-            // refresh races and results
-            await loadRaces();
-            await openRace(selectedRaceId);
-        } catch (err: any) {
-            console.error('Save failed', err);
-            setMessage(err?.message || 'Failed to save results');
-        } finally {
-            setSaving(false);
-        }
-    }
-
-    async function promote(userId: number) {
-        try {
-            await api.post(`/admin/promote/${userId}`);
-            await loadUsersIfAdmin();
-            setMessage('User promoted to admin');
-        } catch (err: any) {
-            console.error(err);
-            setMessage(err?.message || 'Failed to promote user');
-        }
-    }
-
-    async function demote(userId: number) {
-        try {
-            await api.post(`/admin/demote/${userId}`);
-            await loadUsersIfAdmin();
-            setMessage('User demoted');
-        } catch (err: any) {
-            console.error(err);
-            setMessage(err?.message || 'Failed to demote user');
-        }
-    }
-
-    async function recalcOnly() {
-        if (!selectedRaceId) return;
-        setSaving(true);
-        setMessage(null);
-        try {
-            await api.post(`/results/calculate/${selectedRaceId}`);
-            setMessage('Recalculation finished');
-            // update sim status after recalculation
-            try {
-                const status = await api.get(`/simulation/${selectedRaceId}/status`);
-                setSimRunning(!!status.running);
-                setSimStatus(status.status || null);
-            } catch (err) {
-                setSimRunning(false);
-                setSimStatus(null);
-            }
-        } catch (err: any) {
-            console.error('Recalc failed', err);
-            setMessage(err?.message || 'Failed to recalculate');
-        } finally {
-            setSaving(false);
-        }
-    }
-
-    async function startSimulation() {
-        if (!selectedRaceId) return;
-        setSimLoading(true);
-        setMessage(null);
-        try {
-            await api.post(`/simulation/start/${selectedRaceId}`);
-            setMessage('Simulation started');
-            const status = await api.get(`/simulation/${selectedRaceId}/status`);
-            setSimRunning(!!status.running);
-            setSimStatus(status.status || null);
-        } catch (err: any) {
-            console.error('Start simulation failed', err);
-            setMessage(err?.message || 'Failed to start simulation');
-        } finally {
-            setSimLoading(false);
-        }
-    }
-
-    async function stopSimulation() {
-        if (!selectedRaceId) return;
-        setSimLoading(true);
-        setMessage(null);
-        try {
-            await api.post(`/simulation/stop/${selectedRaceId}`);
-            setMessage('Simulation stopped');
-            const status = await api.get(`/simulation/${selectedRaceId}/status`);
-            setSimRunning(!!status.running);
-            setSimStatus(status.status || null);
-        } catch (err: any) {
-            console.error('Stop simulation failed', err);
-            setMessage(err?.message || 'Failed to stop simulation');
-        } finally {
-            setSimLoading(false);
-        }
-    }
-
-    return (
-        <div className="space-y-6 animate-in fade-in duration-300">
-            <div className="flex items-center justify-between">
-                <h1 className="text-2xl font-bold">Admin — Race Results</h1>
-            </div>
-
-            <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
-                <h2 className="font-semibold mb-3">User Management</h2>
-                {!isAdminUser && (
-                    <div className="text-sm text-zinc-400 mb-3">You are not an admin. Sign in as an admin to manage users.</div>
-                )}
-                {isAdminUser && (
-                    <div className="mb-4">
-                        <div className="space-y-2">
-                            {users.map(u => (
-                                <div key={u.id} className="flex items-center justify-between bg-zinc-950/10 p-3 rounded">
-                                    <div>
-                                        <div className="font-medium">{u.username} <span className="text-xs text-zinc-400">({u.email})</span></div>
-                                        <div className="text-xs text-zinc-400">role: {u.role}</div>
-                                    </div>
-                                    <div className="flex items-center gap-2">
-                                        {u.role !== 'ADMIN' ? (
-                                            <button onClick={() => promote(u.id)} className="px-3 py-1 bg-emerald-600 hover:bg-emerald-500 rounded text-sm">Promote</button>
-                                        ) : (
-                                            <button onClick={() => demote(u.id)} className="px-3 py-1 bg-zinc-700 hover:bg-zinc-600 rounded text-sm">Demote</button>
-                                        )}
-                                    </div>
-                                </div>
-                            ))}
-                        </div>
-                    </div>
-                )}
-                <h2 className="font-semibold mb-3">Races</h2>
-                {loading && <div className="text-sm text-zinc-400">Loading races…</div>}
-                {message && <div className="text-sm text-red-400 mb-2">{message}</div>}
-                <div className="space-y-2">
-                    {races.map((r: any) => (
-                        <div key={r.id} className="flex items-center justify-between bg-zinc-950/10 p-3 rounded">
-                            <div>
-                                <div className="font-medium">{r.name}</div>
-                                <div className="text-xs text-zinc-400">{new Date(r.raceDate).toLocaleString()}</div>
-                            </div>
-                            <div className="flex items-center gap-2">
-                                <button onClick={() => openRace(r.id)} className="px-3 py-1 bg-zinc-800 hover:bg-zinc-700 rounded text-sm">Manage Results</button>
-                            </div>
-                        </div>
-                    ))}
-                </div>
-            </div>
-
-            {selectedRaceId && (
-                <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
-                    <div className="flex items-center justify-between mb-3">
-                        <div>
-                            <h3 className="font-semibold">Editing results for race #{selectedRaceId}</h3>
-                            {raceMeta?.team_locked && (
-                                <div className="text-sm text-amber-400">Race completed — teams locked</div>
-                            )}
-                        </div>
-                        <div className="flex items-center gap-2">
-                            <div className="text-sm text-zinc-400 mr-2">Simulation: <span className={`font-medium ${simRunning ? 'text-emerald-400' : 'text-zinc-500'}`}>{simRunning ? 'Running' : 'Stopped'}</span></div>
-                            <button onClick={recalcOnly} disabled={saving} className="px-3 py-1 bg-amber-700 hover:bg-amber-600 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm">Recalculate Only</button>
-                            <button onClick={saveResults} disabled={saving} className="px-3 py-1 bg-red-600 hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm">Save & Recalculate</button>
-                            {simRunning ? (
-                                <button onClick={stopSimulation} disabled={simLoading} className="px-3 py-1 bg-zinc-700 hover:bg-zinc-600 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm">Stop Simulation</button>
-                            ) : (
-                                <button onClick={startSimulation} disabled={simLoading} className="px-3 py-1 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm">Start Simulation</button>
-                            )}
-                        </div>
-                    </div>
-
-                    <div className="overflow-x-auto">
-                        <div className="text-sm text-zinc-400 mb-2">Drag rows to reorder finish positions</div>
-                        <table className="w-full text-left border-collapse min-w-[700px]">
-                            <thead>
-                                <tr className="bg-zinc-950/50 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-400">
-                                    <th className="px-4 py-2">Pos</th>
-                                    <th className="px-4 py-2">Driver</th>
-                                    <th className="px-4 py-2">Fastest Lap</th>
-                                    <th className="px-4 py-2">DNF</th>
-                                    <th className="px-4 py-2">Current Pts</th>
-                                </tr>
-                            </thead>
-                            <tbody className="divide-y divide-zinc-800/50">
-                                {results.map((row, idx) => (
-                                    <tr
-                                        key={row.driverId}
-                                        className={`hover:bg-zinc-800/30 transition-colors ${draggingIndex === idx ? 'opacity-60' : ''}`}
-                                        draggable
-                                        onDragStart={(e) => handleDragStart(e, idx)}
-                                        onDragOver={(e) => handleDragOver(e, idx)}
-                                        onDrop={(e) => handleDrop(e, idx)}
-                                        onDragEnd={handleDragEnd}
-                                    >
-                                        <td className="px-4 py-2 w-28">
-                                            <div className="flex items-center gap-2">
-                                                <span className="text-xs w-6 text-center font-medium">{idx + 1}</span>
-                                                <GripVertical className="w-4 h-4 text-zinc-400 cursor-grab" />
-                                            </div>
-                                        </td>
-                                        <td className="px-4 py-2">
-                                            <div className="font-medium">{row.driverName}</div>
-                                            <div className="text-xs text-zinc-500">id: {row.driverId}</div>
-                                        </td>
-                                        <td className="px-4 py-2 text-center">
-                                            <input type="checkbox" checked={!!row.fastest_lap} onChange={(e) => updateRow(idx, { fastest_lap: e.target.checked })} />
-                                        </td>
-                                        <td className="px-4 py-2 text-center">
-                                            <input type="checkbox" checked={!!row.dnf} onChange={(e) => updateRow(idx, { dnf: e.target.checked })} />
-                                        </td>
-                                        <td className="px-4 py-2 text-right font-mono">{row.points ?? '-'}</td>
-                                    </tr>
-                                ))}
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            )}
+  return (
+    <div className="space-y-6 animate-in fade-in duration-300">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <h1 className="text-2xl font-bold">Admin</h1>
+        <div className="flex gap-2">
+          <button onClick={createTestRace} disabled={busy} className="flex items-center gap-2 px-4 py-2 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 rounded-lg text-sm font-medium">
+            <FlaskConical className="w-4 h-4" /> New test race
+          </button>
+          <button onClick={sync} disabled={busy} className="flex items-center gap-2 px-4 py-2 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 rounded-lg text-sm font-medium">
+            <RefreshCw className={`w-4 h-4 ${busy ? "animate-spin" : ""}`} /> Sync real F1 data
+          </button>
         </div>
-    );
+      </div>
+
+      <ErrorBox>{error}</ErrorBox>
+      <Notice>{message}</Notice>
+
+      <section className="surface p-4">
+        <h2 className="font-semibold mb-3">Races</h2>
+        <div className="space-y-1 max-h-96 overflow-y-auto">
+          {races.map((r) => (
+            <button
+              key={r.id}
+              onClick={() => openRace(r)}
+              className={`w-full flex items-center justify-between gap-3 p-3 rounded text-left transition-colors ${selected?.id === r.id ? "bg-zinc-800" : "hover:bg-zinc-800/50"}`}
+            >
+              <div className="min-w-0">
+                <div className="font-medium truncate">
+                  <span className="font-mono text-zinc-500 mr-2">{r.round ?? "–"}</span>
+                  {r.name}
+                </div>
+                <div className="text-xs text-zinc-500">{formatDate(r.raceStart)}</div>
+              </div>
+              <StatusBadge status={r.status} live={r.live} />
+            </button>
+          ))}
+          {races.length === 0 && <p className="text-sm text-zinc-500">No races — press “Sync real F1 data”.</p>}
+        </div>
+      </section>
+
+      {selected && (
+        <section className="surface p-4 space-y-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <h3 className="font-semibold text-lg">{selected.name}</h3>
+              <div className="text-sm text-zinc-400">
+                {sim?.running ? (
+                  <span className="text-emerald-400">
+                    {sim.mode === "replay" ? "Replaying real race" : "Simulating"} — lap {sim.lap}/{sim.totalLaps}
+                  </span>
+                ) : (
+                  <>Status: {selected.status.toLowerCase()}</>
+                )}
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <Link to={`/race/${selected.id}/live`} className="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 rounded text-sm">
+                <Radio className="w-4 h-4" /> {sim?.testRace ? "Live view" : "Push view"}
+              </Link>
+              {sim?.running ? (
+                <button onClick={stopRun} disabled={busy} className="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-700 hover:bg-zinc-600 disabled:opacity-50 rounded text-sm">
+                  <Square className="w-4 h-4" /> Stop
+                </button>
+              ) : (
+                <>
+                  {sim?.testRace && selected.status !== "COMPLETED" && (
+                    <button onClick={startRun} disabled={busy} className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 disabled:opacity-50 rounded text-sm">
+                      <Play className="w-4 h-4" /> Simulate
+                    </button>
+                  )}
+                  <button onClick={saveResults} disabled={busy || rows.length === 0} className="px-3 py-1.5 bg-red-600 hover:bg-red-500 shadow-lg shadow-red-950/40 disabled:opacity-50 rounded text-sm">
+                    Save results & score
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+
+          {!sim?.running && (
+            <div className="overflow-x-auto">
+              <p className="text-sm text-zinc-400 mb-2">
+                {sim?.testRace
+                  ? "Drag rows to set the finishing order. DNF drivers are classified at the back."
+                  : "Real races are scored automatically from official results. Only edit here to correct a mistake."}
+              </p>
+              <table className="w-full text-left border-collapse min-w-[560px]">
+                <thead>
+                  <tr className="bg-zinc-950/50 border-b border-zinc-800 text-xs uppercase tracking-wider text-zinc-400">
+                    <th className="px-4 py-2">Pos</th>
+                    <th className="px-4 py-2">Driver</th>
+                    <th className="px-4 py-2 text-center">Fastest lap</th>
+                    <th className="px-4 py-2 text-center">DNF</th>
+                    <th className="px-4 py-2 text-right">Pts</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-zinc-800/50">
+                  {rows.map((row, idx) => (
+                    <tr
+                      key={row.driverId}
+                      draggable
+                      onDragStart={() => setDragging(idx)}
+                      onDragOver={(e) => e.preventDefault()}
+                      onDrop={() => onDrop(idx)}
+                      onDragEnd={() => setDragging(null)}
+                      className={`hover:bg-zinc-800/30 ${dragging === idx ? "opacity-50" : ""}`}
+                    >
+                      <td className="px-4 py-2 w-24">
+                        <div className="flex items-center gap-2">
+                          <GripVertical className="w-4 h-4 text-zinc-500 cursor-grab" />
+                          <span className="font-mono text-sm">{row.dnf ? "DNF" : idx + 1}</span>
+                        </div>
+                      </td>
+                      <td className="px-4 py-2 font-medium">{row.driverName}</td>
+                      <td className="px-4 py-2 text-center">
+                        <input type="radio" name="fastest" checked={row.fastest_lap} onChange={(e) => setFastestLap(idx, e.target.checked)} />
+                      </td>
+                      <td className="px-4 py-2 text-center">
+                        <input type="checkbox" checked={row.dnf} onChange={(e) => setRows((p) => p.map((r, i) => (i === idx ? { ...r, dnf: e.target.checked } : r)))} />
+                      </td>
+                      <td className="px-4 py-2 text-right font-mono">{row.points ?? "–"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      )}
+
+      <section className="surface p-4">
+        <h2 className="font-semibold mb-1">Teams</h2>
+        <p className="text-xs text-zinc-500 mb-3">
+          Team principals and logos aren't reliably available from free APIs. Logos are filled from Wikipedia on the first sync and never overwritten
+          afterwards, so fix any outdated one here (paste an https image URL). Prices are recalculated on each sync.
+        </p>
+        <div className="space-y-2">
+          {teams.map((t) => (
+            <TeamRow key={t.id} team={t} onSave={(patch) => saveTeam(t, patch)} disabled={busy} />
+          ))}
+        </div>
+      </section>
+
+      <section className="surface p-4">
+        <h2 className="font-semibold mb-3">Users</h2>
+        <div className="space-y-1">
+          {users.map((u) => (
+            <div key={u.id} className="flex items-center justify-between p-3 rounded hover:bg-zinc-800/30">
+              <div>
+                <div className="font-medium">
+                  {u.username} <span className="text-xs text-zinc-400">({u.email})</span>
+                </div>
+                <div className="text-xs text-zinc-500">{u.role}</div>
+              </div>
+              {u.id !== me?.id &&
+                (u.role !== "ADMIN" ? (
+                  <button onClick={() => run(() => api.post(`/admin/promote/${u.id}`).then(loadUsers), "User promoted")} className="px-3 py-1 bg-emerald-700 hover:bg-emerald-600 rounded text-sm">
+                    Promote
+                  </button>
+                ) : (
+                  <button onClick={() => run(() => api.post(`/admin/demote/${u.id}`).then(loadUsers), "User demoted")} className="px-3 py-1 bg-zinc-700 hover:bg-zinc-600 rounded text-sm">
+                    Demote
+                  </button>
+                ))}
+            </div>
+          ))}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function TeamRow({ team, onSave, disabled }: { team: Constructor; onSave: (patch: Partial<Constructor>) => void; disabled: boolean }) {
+  const [principal, setPrincipal] = useState(team.teamPrincipal || "");
+  const [logo, setLogo] = useState(team.logoUrl || "");
+  const changed = principal !== (team.teamPrincipal || "") || logo !== (team.logoUrl || "");
+  return (
+    <div className="flex flex-wrap items-center gap-3 p-2 rounded hover:bg-zinc-800/30">
+      <span className="w-3 h-3 rounded-full" style={{ background: team.color ? `#${team.color}` : "#555" }} />
+      <TeamLogo url={logo || null} name={team.name} size={32} />
+      <span className="font-medium w-32">{team.name}</span>
+      <input
+        value={principal}
+        onChange={(e) => setPrincipal(e.target.value)}
+        placeholder="Team principal"
+        className="flex-1 min-w-36 bg-zinc-950 border border-zinc-800 rounded px-3 py-1.5 text-sm"
+      />
+      <input
+        value={logo}
+        onChange={(e) => setLogo(e.target.value)}
+        placeholder="Logo URL (https://…)"
+        className="flex-1 min-w-48 bg-zinc-950 border border-zinc-800 rounded px-3 py-1.5 text-sm font-mono text-xs"
+      />
+      <span className="font-mono text-sm text-zinc-400 w-16 text-right">${team.price}M</span>
+      <button
+        disabled={!changed || disabled}
+        onClick={() => onSave({ teamPrincipal: principal, logoUrl: logo || null })}
+        className="px-3 py-1.5 bg-zinc-700 hover:bg-zinc-600 disabled:opacity-40 rounded text-sm"
+      >
+        Save
+      </button>
+    </div>
+  );
 }

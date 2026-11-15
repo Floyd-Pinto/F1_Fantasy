@@ -8,26 +8,29 @@ import { TeamBuilder } from "./pages/TeamBuilder";
 import { Results } from "./pages/Results";
 import { Leaderboard } from "./pages/Leaderboard";
 import { Admin } from "./pages/Admin";
+import { LiveRace } from "./pages/LiveRace";
+import { Replay } from "./pages/Replay";
+import { Races } from "./pages/Races";
+import { Profile } from "./pages/Profile";
+import { Rules } from "./pages/Rules";
+import { DriverPage } from "./pages/DriverPage";
+import { Grid } from "./pages/Grid";
 
 function ErrorBoundary() {
   const error = useRouteError();
   console.error(error);
-
-  // Handle 404s and Route errors gracefully
-  let errorMessage = String(error);
-  if (error && typeof error === 'object' && 'statusText' in error) {
-    errorMessage = `${(error as any).status} ${(error as any).statusText}`;
-  } else if (error instanceof Error) {
-    errorMessage = error.message + '\n' + error.stack;
-  }
+  const message =
+    error && typeof error === "object" && "statusText" in error
+      ? `${(error as any).status} ${(error as any).statusText}`
+      : error instanceof Error
+        ? error.message
+        : "Something went wrong.";
 
   return (
-    <div className="p-8 bg-red-950 text-white min-h-screen font-mono flex flex-col items-center justify-center text-center">
-      <h1 className="text-3xl font-bold mb-4">Application Error</h1>
-      <pre className="bg-black/50 p-6 rounded-xl whitespace-pre-wrap max-w-3xl text-left overflow-auto">
-        {errorMessage}
-      </pre>
-      <a href="/" className="mt-8 px-6 py-3 bg-red-600 hover:bg-red-700 rounded-lg font-bold transition-colors">
+    <div className="p-8 bg-zinc-950 text-white min-h-screen flex flex-col items-center justify-center text-center">
+      <h1 className="text-3xl font-bold mb-4">Something went wrong</h1>
+      <p className="text-zinc-400 max-w-xl">{message}</p>
+      <a href="/" className="mt-8 px-6 py-3 bg-red-600 hover:bg-red-500 shadow-lg shadow-red-950/40 rounded-lg font-bold transition-colors">
         Return to Home
       </a>
     </div>
@@ -35,16 +38,8 @@ function ErrorBoundary() {
 }
 
 export const router = createBrowserRouter([
-  {
-    path: "/login",
-    Component: Login,
-    errorElement: <ErrorBoundary />,
-  },
-  {
-    path: "/register",
-    Component: Register,
-    errorElement: <ErrorBoundary />,
-  },
+  { path: "/login", Component: Login, errorElement: <ErrorBoundary /> },
+  { path: "/register", Component: Register, errorElement: <ErrorBoundary /> },
   {
     path: "/",
     Component: Layout,
@@ -55,13 +50,21 @@ export const router = createBrowserRouter([
       { path: "league/:leagueId", Component: League },
       { path: "league/:leagueId/race/:raceId/team-builder", Component: TeamBuilder },
       { path: "league/:leagueId/race/:raceId/results", Component: Results },
+      { path: "league/:leagueId/race/:raceId/live", Component: LiveRace },
+      { path: "league/:leagueId/race/:raceId/replay", Component: Replay },
+      { path: "race/:raceId/live", Component: LiveRace },
+      { path: "race/:raceId/replay", Component: Replay },
+      { path: "race/:raceId/results", Component: Results },
+      { path: "races", Component: Races },
+      { path: "live", element: <Navigate to="/races" replace /> },
+      { path: "profile", Component: Profile },
+      { path: "rules", Component: Rules },
+      { path: "driver/:driverId", Component: DriverPage },
+      { path: "grid", Component: Grid },
       { path: "admin", Component: Admin },
       { path: "leaderboard", Component: Leaderboard },
-      { path: "*", Component: () => <Navigate to="/" replace /> }
+      { path: "*", element: <Navigate to="/" replace /> },
     ],
   },
-  {
-    path: "*",
-    Component: () => <Navigate to="/" replace />
-  }
+  { path: "*", element: <Navigate to="/" replace /> },
 ]);
