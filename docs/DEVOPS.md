@@ -54,16 +54,14 @@ test database, on `localhost`. Jenkins drives the host's Docker engine through t
 ## History
 
 ### v1 (May 2026)
-Built against the original app and repository. The git history records the setup:
+Built against the original version of the app (the first commit in this repository). How it was set up:
 
-| Commit | Date | What happened |
-|---|---|---|
-| `f5856f1` | 2026-05-03 | *Add Jenkinsfile and SonarQube config* |
-| `1c6530b` | 2026-05-03 | *Test webhook trigger*: first GitHub → Jenkins webhook test |
-| `15a0cd5` | 2026-05-03 | *Remove redundant checkout stage* (declarative pipelines check out automatically) |
-| `cbc18f4` | 2026-05-03 | *Use system node, remove tool dependency* (Node installed in the Jenkins image) |
-| `06998f3`, `9bfefd2` | 2026-05-03 | *Test full pipeline trigger* |
-| `a8bb761`, `43e57e7` | 2026-05-05 | *Pipeline test*: end-to-end runs including deploy |
+| Date | Step |
+|---|---|
+| 2026-05-03 | Jenkinsfile and SonarQube config added; Jenkins and SonarQube started in Docker |
+| 2026-05-03 | GitHub → Jenkins push webhook configured and tested with trigger commits |
+| 2026-05-03 | Pipeline simplified: the redundant checkout stage was removed (declarative pipelines check out automatically) and Node was installed in the Jenkins image instead of a Jenkins tool |
+| 2026-05-03 – 05 | Full end-to-end runs, from push through quality gate to deploy on EC2 |
 
 v1 pipeline (`archive/devops-v1/Jenkinsfile`): `npm install` (backend and frontend) → SonarQube analysis →
 quality gate → SSH to an AWS EC2 instance (IP hard-coded) → run `~/deploy.sh` there.
